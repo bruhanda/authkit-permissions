@@ -1,1627 +1,1181 @@
 # `@authkit/permissions` — Architecture Plan
 
-> Lightweight, zero-dependency, TypeScript-first RBAC/ABAC with first-class
-> multi-tenant context. Targets `<5KB` gzipped core, runs unchanged in
-> Node 18+, browsers, Bun, Deno, Cloudflare Workers and Vercel Edge.
+> Lightweight, **zero-dependency**, TypeScript-first RBAC/ABAC with a multi-tenant
+> context as a first-class citizen. Targets **<5KB gzipped** for the core engine
+> and runs unmodified in **Node 18+, Bun, Deno, Browser, Cloudflare Workers and
+> Vercel Edge**. Optional, tree-shakeable adapters for **Next.js, Hono, Express,
+> Fastify, NestJS, tRPC, React and Vue**.
 
-This document is the source of truth for the implementation. It describes
-the project layout, the public API, internal modules, type system,
-error model, bundle/tree-shaking strategy, dependencies, configuration
-and edge cases. Implementation source is intentionally NOT included
-here — only the contract.
+The library is positioned to fill the vacuum left by the abandonment of
+`accesscontrol` (last release 2022) and to compete on **DX + bundle-size**
+against `@casl/ability` (~12 KB, no first-class tenant) and `casbin` (~80 KB,
+PERM/CONF DSL). Source of truth for the market problem statement is
+`reports/03-rbac-permissions.json` (id `03`, dated 2026-04-27).
 
-A `## Review Changes` log at the bottom records every adjustment made
-in response to PR review feedback.
+---
+
+## Table of Contents
+
+1. [Project Structure](#1-project-structure)
+2. [Public API Design](#2-public-api-design)
+3. [Internal Architecture](#3-internal-architecture)
+4. [Type System](#4-type-system)
+5. [Error Handling Strategy](#5-error-handling-strategy)
+6. [Bundle & Tree-shaking Plan](#6-bundle--tree-shaking-plan)
+7. [Dependencies](#7-dependencies)
+8. [Configuration](#8-configuration)
+9. [Edge Cases](#9-edge-cases)
 
 ---
 
 ## 1. Project Structure
 
+Every file in `src/` is single-purpose; no file imports from `dist/`, no file
+imports from a sibling `index.ts` re-export (we re-export only at package
+boundaries to keep the dep graph acyclic and tree-shakeable).
+
 ```
 authkit-permissions/
-├── package.json                     # Public manifest + subpath exports
-├── PLAN.md                          # This document
-├── README.md                        # Public-facing introduction
+├── PLAN.md                          # this document
+├── README.md                        # user-facing docs (5-min getting started)
 ├── LICENSE                          # MIT
-├── .gitignore
-├── .npmignore
-├── tsconfig.json                    # Strict TS config (used by editors)
-├── tsconfig.build.json              # Emit-only config for tsup
-├── tsup.config.ts                   # Multi-entry ESM/CJS build
-├── vitest.config.ts                 # Unit + type tests
-├── vitest.workspace.ts              # Workspaces: core, adapters, types
-├── biome.json                       # Lint + format (zero-dep, fast)
-├── size-limit.json                  # Per-entry bundle budgets (CI-enforced)
-├── .changeset/                      # Versioning workflow
-├── benchmarks/
-│   └── perf.bench.ts                # `vitest bench` — check throughput
-├── examples/
-│   ├── nextjs-app-router/           # Showcase Route-Handlers + middleware
-│   ├── hono-edge/                   # Cloudflare Worker example
-│   ├── trpc-server/                 # tRPC procedure middleware
-│   └── react-spa/                   # `<Can/>` + `useCan()` demo
-├── docs/                            # MD docs published to website later
-│   ├── getting-started.md
-│   ├── policy-dsl.md
-│   ├── multi-tenant.md
-│   ├── conditions.md
-│   ├── adapters.md
-│   ├── orm-filters.md               # `accessibleBy()` + Prisma/Drizzle/Mongoose
-│   ├── audit-and-compliance.md
-│   └── migration-from-casl.md
-├── src/
-│   ├── index.ts                     # Public barrel for the core entry
-│   │
-│   ├── core/                        # Pure, runtime-agnostic kernel
-│   │   ├── define-policy.ts         # `definePolicy()` constructor
-│   │   ├── permissions.ts           # Returned `Permissions<T>` object
-│   │   ├── ability.ts               # `abilityFor(subject)` -> `Ability<T>`
-│   │   ├── evaluator.ts             # Decision engine (precedence-aware)
-│   │   ├── matcher.ts               # Wildcard / list / exact matching
-│   │   ├── role-graph.ts            # Topological sort + cycle detection
-│   │   ├── condition.ts             # Sync/async condition adapter
-│   │   ├── tenant.ts                # First-class tenant guard (cross-tenant gated)
-│   │   ├── decision.ts              # `Decision` factory + reason codes
-│   │   ├── serialize.ts             # Free-function `serialize(permissions)`
-│   │   ├── accessible-by.ts         # `accessibleBy(ability, resource)` filter AST
-│   │   └── freeze.ts                # `deepFreeze()` — policy immutability
-│   │
-│   ├── builder/                     # Optional imperative builder (own subpath)
-│   │   └── index.ts                 # `AbilityBuilder` (advanced/dynamic)
-│   │
-│   ├── audit/                       # Optional logging hooks
-│   │   ├── index.ts                 # Public re-export
-│   │   ├── hook.ts                  # `AuditHook` contract
-│   │   └── presets.ts               # `consoleAudit()`, `noopAudit()`
-│   │
-│   ├── errors/                      # Error model
-│   │   ├── index.ts
-│   │   ├── codes.ts                 # `ErrorCode` const enum
-│   │   ├── permission-error.ts      # Thrown by `enforce()`
-│   │   ├── policy-error.ts          # Thrown at `definePolicy()` time
-│   │   ├── audit-error.ts           # Thrown when auditFailureMode === 'throw'
-│   │   └── tenant-mismatch-error.ts # Thrown when tenant guard trips
-│   │
-│   ├── types/                       # Pure types — zero runtime
-│   │   ├── index.ts                 # Re-export of all public types
-│   │   ├── policy.ts                # PolicyDefinition / Rule / RoleDef
-│   │   ├── subject.ts               # `Subject<TRole>` shape
-│   │   ├── decision.ts              # Decision + Reason
-│   │   ├── condition.ts             # ConditionFn signatures
-│   │   ├── instances.ts             # `ResourceInstanceMap` per-resource shapes
-│   │   ├── inference.ts             # InferRoles / InferResources / InferActions
-│   │   └── check-args.ts            # CheckArgs<T, R, A> conditional type
-│   │
-│   ├── utils/                       # Internal-only helpers (not exported)
-│   │   ├── invariant.ts             # `invariant(cond, code, msg)`
-│   │   ├── memoize.ts               # WeakMap-backed memo for ability()
-│   │   ├── set-ops.ts               # union / intersection (Set polyfilled)
-│   │   ├── env.ts                   # Edge-safe `isProduction()` / `isDev()`
-│   │   └── normalize.ts             # Normalize rule.role/resource/action to arrays
-│   │
-│   ├── orm/                         # ORM/query-builder integrations (own subpaths)
-│   │   ├── prisma/
-│   │   │   └── index.ts             # `accessibleBy()` -> Prisma `where`
-│   │   ├── drizzle/
-│   │   │   └── index.ts             # `accessibleBy()` -> Drizzle SQL chunk
-│   │   └── mongoose/
-│   │       └── index.ts             # `accessibleBy()` -> Mongo filter doc
-│   │
-│   ├── adapters/                    # Each adapter is its own entry
-│   │   ├── next/
-│   │   │   ├── index.ts             # Public barrel
-│   │   │   ├── middleware.ts        # `nextPermissions()` for App Router
-│   │   │   └── route-handler.ts     # `protectRoute()` per-route helper
-│   │   ├── hono/
-│   │   │   └── index.ts             # `honoPermissions({permissions})`
-│   │   ├── express/
-│   │   │   └── index.ts             # `expressPermissions()` middleware factory
-│   │   ├── fastify/
-│   │   │   └── index.ts             # Fastify plugin (`fastifyPermissions`)
-│   │   ├── nestjs/
-│   │   │   ├── index.ts
-│   │   │   ├── permissions.guard.ts # `PermissionsGuard`
-│   │   │   ├── permissions.module.ts# `PermissionsModule.forRoot()`
-│   │   │   └── decorators.ts        # `@RequirePermission(...)`
-│   │   └── trpc/
-│   │       └── index.ts             # `trpcPermissions()` factory + per-procedure helper
-│   │
-│   ├── react/                       # React 18+ adapter
-│   │   ├── index.ts
-│   │   ├── permissions-provider.tsx # `<PermissionsProvider/>` (Context)
-│   │   ├── use-can.ts               # `useCan()` hook
-│   │   └── can.tsx                  # `<Can/>` component
-│   │
-│   └── vue/                         # Vue 3 adapter
-│       ├── index.ts
-│       ├── plugin.ts                # `createPermissionsPlugin()`
-│       ├── use-can.ts               # `useCan()` composable
-│       └── can.ts                   # `<Can/>` functional component (h())
+├── package.json                     # see §8
+├── tsconfig.json                    # strict, ES2022, NodeNext, declaration
+├── tsconfig.build.json              # build-only overrides (no tests)
+├── tsup.config.ts                   # multi-entry esm+cjs+dts bundler
+├── vitest.config.ts                 # workspace incl. workers / browser pools
+├── biome.json                       # lint + format (replaces eslint+prettier)
+├── .gitignore                       # see §8
+├── .changeset/                      # changesets release tracking
+│   └── config.json
+├── .github/
+│   └── workflows/
+│       ├── ci.yml                   # test + typecheck + size-limit + attw
+│       └── release.yml              # changesets publish on main
 │
-└── tests/
-    ├── core/
-    │   ├── define-policy.test.ts
-    │   ├── role-hierarchy.test.ts   # extends, multi-inherit, cycles
-    │   ├── matcher.test.ts          # wildcards, arrays
-    │   ├── evaluator.test.ts        # precedence, priority, no-match
-    │   ├── condition-sync.test.ts
-    │   ├── condition-async.test.ts
-    │   ├── tenant-isolation.test.ts # cross-tenant attempts always deny
-    │   ├── cross-tenant.test.ts     # `crossTenant: true` + `allowCrossTenant: true`
-    │   ├── ability.test.ts          # scoped ability + caching
-    │   ├── serialize.test.ts        # free-function serialize / dropped conditions
-    │   └── accessible-by.test.ts    # filter AST shape, wildcard handling
-    ├── builder/
-    │   └── builder.test.ts
-    ├── orm/
-    │   ├── prisma.test.ts
-    │   ├── drizzle.test.ts
-    │   └── mongoose.test.ts
-    ├── audit/
-    │   ├── hook.test.ts
-    │   └── failure-mode.test.ts     # log / throw / deny
-    ├── errors/
-    │   └── error-shapes.test.ts
-    ├── types/
-    │   ├── inference.test-d.ts      # `vitest --typecheck`
-    │   ├── check-args.test-d.ts
-    │   ├── rule-narrowing.test-d.ts # Rule.action narrows by Rule.resource
-    │   ├── instance-typing.test-d.ts# Per-resource ConditionFn target types
-    │   └── adapter-types.test-d.ts
-    ├── adapters/
-    │   ├── next.test.ts
-    │   ├── hono.test.ts
-    │   ├── express.test.ts
-    │   ├── fastify.test.ts
-    │   ├── nestjs.test.ts
-    │   └── trpc.test.ts
-    ├── react/
-    │   ├── use-can.test.tsx
-    │   └── can.test.tsx
-    ├── vue/
-    │   └── use-can.test.ts
-    └── e2e/
-        ├── multi-tenant-saas.test.ts
-        ├── role-inheritance-real.test.ts
-        ├── compliance-audit.test.ts
-        └── edge-runtime-smoke.test.ts # Runs in `@cloudflare/vitest-pool-workers`
+├── src/
+│   ├── index.ts                     # single public entrypoint for core
+│   │                                # re-exports definePolicy, createEnforcer,
+│   │                                # createSubject, type helpers, error class
+│   │
+│   ├── core/
+│   │   ├── policy.ts                # definePolicy() — pure data validator
+│   │   │                            # - normalises role graph
+│   │   │                            # - freezes policy object (Object.freeze)
+│   │   │                            # - returns typed Policy<P> handle
+│   │   ├── enforcer.ts              # createEnforcer() — stateless check engine
+│   │   │                            # - resolves effective permissions per role
+│   │   │                            # - evaluates conditions sync/async
+│   │   │                            # - emits audit events
+│   │   ├── role-graph.ts            # topological order + cycle detection
+│   │   │                            # - compiled once at definePolicy() time
+│   │   │                            # - precomputes transitive role closure
+│   │   ├── matcher.ts               # wildcard + literal action/resource match
+│   │   │                            # - "*", "post:*", "*:read", "post:read"
+│   │   │                            # - segment-aware glob, no regex (perf)
+│   │   ├── conditions.ts            # condition registry + evaluator
+│   │   │                            # - sync returns boolean, async returns Promise<boolean>
+│   │   │                            # - short-circuits on any-deny
+│   │   ├── effective.ts             # resolveEffectivePermissions(roles[])
+│   │   │                            # - LRU memoised by role-set hash
+│   │   ├── memo.ts                  # tiny LRU (≈30 LOC) — used by effective.ts
+│   │   └── freeze.ts                # deepFreeze helper for defensive copies
+│   │
+│   ├── types/
+│   │   ├── index.ts                 # type-only public surface
+│   │   ├── policy.ts                # Policy, RoleDef, ResourceDef, RuleDef
+│   │   ├── subject.ts               # Subject<TRole, TTenant>
+│   │   ├── context.ts               # CheckContext, ResourceData
+│   │   ├── result.ts                # CheckResult, DenyReason, Decision
+│   │   ├── condition.ts             # ConditionFn + AsyncConditionFn
+│   │   ├── audit.ts                 # AuditEvent, AuditHook
+│   │   └── inference.ts             # type-level helpers:
+│   │                                # InferActions<P, R>, InferResources<P>,
+│   │                                # InferRoles<P>, InferConditions<P>
+│   │
+│   ├── errors/
+│   │   ├── index.ts                 # subpath barrel: error class + codes
+│   │   ├── base.ts                  # PermissionError extends Error
+│   │   └── codes.ts                 # ERROR_CODES const + type
+│   │
+│   ├── audit/
+│   │   ├── index.ts                 # audit subpath barrel
+│   │   ├── hook.ts                  # AuditHook type + composeAudit(...hooks)
+│   │   ├── formatter.ts             # default structured JSON formatter
+│   │   └── timing.ts                # opt-in performance.now() timing wrapper
+│   │
+│   ├── builder/
+│   │   ├── index.ts                 # createPolicyBuilder() — fluent DSL
+│   │   └── fluent.ts                # internal builder state machine
+│   │
+│   ├── utils/
+│   │   ├── invariant.ts             # invariant(cond, msg, code) → throws PermissionError
+│   │   ├── is-record.ts             # narrow `unknown` → Record<string, unknown>
+│   │   └── set-ops.ts               # union/intersect for tiny role sets
+│   │
+│   ├── adapters/
+│   │   ├── next/
+│   │   │   ├── index.ts             # withPermissions(handler), createMiddleware()
+│   │   │   └── route-handler.ts     # type-narrowed wrappers for App Router
+│   │   ├── hono/
+│   │   │   └── index.ts             # createHonoMiddleware(enforcer, getSubject)
+│   │   ├── express/
+│   │   │   └── index.ts             # createExpressMiddleware(...)
+│   │   ├── fastify/
+│   │   │   └── index.ts             # createFastifyPlugin(...)
+│   │   ├── nestjs/
+│   │   │   ├── index.ts             # PermissionsGuard, @Requires() decorator
+│   │   │   └── module.ts            # PermissionsModule.forRoot()
+│   │   └── trpc/
+│   │       └── index.ts             # createPermissionsMiddleware<TRPC>()
+│   │
+│   ├── orm/
+│   │   ├── prisma/
+│   │   │   └── index.ts             # createPrismaRoleAdapter(prisma, schema)
+│   │   ├── drizzle/
+│   │   │   └── index.ts             # createDrizzleRoleAdapter(db, table)
+│   │   └── mongoose/
+│   │       └── index.ts             # createMongooseRoleAdapter(model)
+│   │
+│   ├── react/
+│   │   ├── index.ts                 # public surface (useCan, <Can/>, provider)
+│   │   ├── context.tsx              # PermissionContext (React.createContext)
+│   │   ├── provider.tsx             # <PermissionProvider enforcer subject />
+│   │   ├── use-can.ts               # useCan(action, resource, data?)
+│   │   └── can.tsx                  # <Can/> component with `fallback` slot
+│   │
+│   └── vue/
+│       ├── index.ts                 # public surface
+│       ├── plugin.ts                # createPermissionsPlugin() Vue 3 plugin
+│       ├── use-can.ts               # useCan() composable
+│       └── can.ts                   # <Can/> SFC (defineComponent)
+│
+├── test/
+│   ├── core/
+│   │   ├── policy.test.ts           # definePolicy validation, freeze, cycles
+│   │   ├── enforcer.test.ts         # check() matrix
+│   │   ├── role-graph.test.ts       # cycle detection, deep inheritance
+│   │   ├── matcher.test.ts          # wildcards
+│   │   ├── conditions.test.ts       # sync + async + missing condition
+│   │   └── multi-tenant.test.ts     # tenant-leakage regression matrix
+│   ├── types/
+│   │   └── inference.test-d.ts      # vitest --typecheck
+│   ├── adapters/
+│   │   ├── hono.test.ts
+│   │   ├── express.test.ts
+│   │   ├── fastify.test.ts
+│   │   ├── trpc.test.ts
+│   │   └── next.test.ts
+│   ├── react/
+│   │   ├── use-can.test.tsx
+│   │   └── can.test.tsx             # @testing-library/react
+│   ├── vue/
+│   │   └── use-can.test.ts          # @vue/test-utils
+│   ├── runtime/
+│   │   ├── workers.test.ts          # @cloudflare/vitest-pool-workers
+│   │   └── edge.test.ts             # globalThis.process undefined check
+│   └── bench/
+│       └── enforcer.bench.ts        # vitest bench
+│
+└── examples/                        # not published — referenced from README
+    ├── nextjs-app-router/
+    ├── hono-edge/
+    ├── trpc-multi-tenant/
+    └── nestjs-guard/
 ```
 
-**Why this layout:**
+### Why split `core` into 8 small files?
 
-- `src/core` is **pure and runtime-agnostic** — no Node APIs (`process`, `fs`,
-  `Buffer`), no DOM, no React. Anything that needs a host (Express, React,
-  fetch) lives behind `src/adapters` or `src/react|vue`. This is what lets
-  the core run unchanged on Cloudflare Workers and Vercel Edge.
-- Each adapter has its own subpath export (see §6). A consumer who imports
-  `@authkit/permissions` never pays for `react`, `next`, `nestjs`, ORM
-  filters or the imperative builder.
-- `src/builder` and `src/orm/*` live outside `core/` so they can move as
-  optional subpaths without bloating the default bundle.
-- `src/types` is isolated so `import type {...}` paths never drag runtime in.
-- `src/utils` is **internal**: utilities are not re-exported from the public
-  barrel, so we can refactor them freely without semver impact. `utils/env.ts`
-  centralizes runtime-feature detection (see §6.2 for the
-  `typeof process !== 'undefined'` rule).
+Each file is < 150 LOC and has a single responsibility. Tree-shakers (Rollup,
+esbuild) can drop any unused leaf. The same module graph is bundled by `tsup`
+with `treeshake: 'recommended'` so a consumer that only calls `definePolicy`
+will not pull `enforcer.ts`, `effective.ts` or `memo.ts`.
 
 ---
 
 ## 2. Public API Design
 
-### 2.1 `definePolicy()` — the entry point
+The library has **one mental model** the user must learn:
+
+> *Policy is a value, not a config file.*
+
+A policy is a frozen TypeScript object produced by `definePolicy(...)`. From
+that single value we **infer** every legal `(role, resource, action)` triple at
+the type level. The user then creates an `Enforcer` (a stateless functional
+object) and calls `enforcer.check(...)` per request. There is no global state,
+no singleton, no mutation API, no ".conf" file.
+
+### 2.1 `definePolicy` — the one-call factory
 
 ```ts
 /**
- * Define an immutable, type-inferable RBAC/ABAC policy.
+ * Define a frozen, fully-typed RBAC/ABAC policy.
  *
- * The returned `Permissions` object exposes type-safe `check`, `can`,
- * `enforce`, `abilityFor` and helpers. All actions/resources/roles
- * referenced anywhere in this library are **inferred from the policy
- * literal you pass here** — there is no string-typed escape hatch.
+ * The returned `Policy` is the source of truth for *all* compile-time type
+ * inference (roles, resources, actions, conditions). It is also a frozen
+ * runtime value — mutations throw in strict mode and are silently discarded
+ * in sloppy mode.
  *
- * @typeParam TPolicy The literal type of the policy. To get full
- *                    inference, pass the policy as an object literal
- *                    OR use `as const satisfies PolicyDefinition`.
- * @typeParam TInstances Optional map of resource-key -> concrete TS shape
- *                    for tightly-typed `target` parameters in conditions
- *                    and `check()` calls. Defaults to a permissive
- *                    `{ tenantId?: string; [k: string]: unknown }` per
- *                    resource. See §4.3.
- *
- * @param policy The policy definition. Frozen with `Object.freeze`
- *               recursively at construction time — mutating the input
- *               object after `definePolicy()` returns is a no-op.
- *
- * @returns A `Permissions<TPolicy, TInstances>` instance. Cheap to create
- *          (single pass over rules), safe to keep as a module-level
- *          singleton.
- *
- * @throws {PolicyError} `INVALID_POLICY` if the shape is malformed,
- *                      `CYCLE_DETECTED` if `roles[*].extends` forms a
- *                      cycle, `UNKNOWN_ROLE`/`UNKNOWN_RESOURCE`/
- *                      `UNKNOWN_ACTION` if a rule references something
- *                      not declared in `roles`/`resources`,
- *                      `EMPTY_FIELDS` if any rule has `fields: []`.
+ * @typeParam P - inferred shape of the policy literal. Never specify manually.
+ * @param spec - declarative policy literal (see {@link PolicySpec}).
+ * @returns frozen, validated {@link Policy} handle.
+ * @throws {@link PermissionError} with code `INVALID_POLICY` when the spec is
+ *   structurally invalid (e.g. role cycle, unknown resource in `permissions`,
+ *   missing condition referenced from a rule).
  *
  * @example
- * ```ts
- * import { definePolicy } from '@authkit/permissions';
- *
- * type Instances = { post: Post; comment: Comment; billing: BillingAccount };
- *
- * export const permissions = definePolicy<typeof policy, Instances>({
- *   roles: {
- *     owner:  { extends: ['admin']  },
- *     admin:  { extends: ['member'] },
- *     member: { extends: ['viewer'] },
- *     viewer: {},
- *   },
- *   resources: {
- *     post:    { actions: ['read', 'create', 'update', 'delete', 'publish'] },
- *     comment: { actions: ['read', 'create', 'delete'] },
- *     billing: { actions: ['read', 'manage'] },
- *   },
- *   rules: [
- *     { role: 'viewer', resource: 'post',    action: 'read' },
- *     { role: 'member', resource: 'post',    action: ['create'] },
- *     { role: 'admin',  resource: 'post',    action: '*' },
- *     { role: 'owner',  resource: 'billing', action: 'manage' },
- *     {
- *       role: 'member', resource: 'post', action: ['update', 'delete'],
- *       // `target` is now narrowed to `Post` (not `ResourceInstance`).
- *       condition: ({ subject, target }) => target?.authorId === subject.id,
+ *   const policy = definePolicy({
+ *     roles: {
+ *       owner:  { extends: ['admin'] },
+ *       admin:  { extends: ['member'] },
+ *       member: { extends: ['viewer'] },
+ *       viewer: {},
  *     },
- *   ],
- *   options: { precedence: 'deny', strictTenant: true },
- * } as const);
- * ```
+ *     resources: {
+ *       project:  { actions: ['create', 'read', 'update', 'delete', 'invite'] },
+ *       document: { actions: ['create', 'read', 'update', 'delete', 'comment'] },
+ *     },
+ *     conditions: {
+ *       isOwner:    ({ subject, resource }) => resource?.ownerId === subject.id,
+ *       sameTenant: ({ subject, resource }) => resource?.tenantId === subject.tenantId,
+ *     },
+ *     permissions: {
+ *       viewer: {
+ *         project:  ['read'],
+ *         document: ['read', 'comment'],
+ *       },
+ *       member: {
+ *         document: {
+ *           create: true,
+ *           update: { when: 'isOwner' },
+ *           delete: { when: ['isOwner', 'sameTenant'] }, // AND
+ *         },
+ *       },
+ *       admin: {
+ *         project:  ['create', 'update', 'invite'],
+ *         document: ['delete'],
+ *       },
+ *       owner: {
+ *         project:  ['*'], // all actions defined for `project`
+ *         document: ['*'],
+ *       },
+ *     },
+ *   });
  */
-export declare function definePolicy<
-  const TPolicy extends PolicyDefinition,
-  TInstances extends ResourceInstanceMap<TPolicy> = DefaultInstances<TPolicy>,
->(policy: TPolicy): Permissions<TPolicy, TInstances>;
+export function definePolicy<const P extends PolicySpec>(spec: P): Policy<P>;
 ```
 
-> The `const` modifier on the type parameter (`<const TPolicy>`) preserves
-> literal narrowing without requiring the caller to write `as const`.
-> This is the single most important type-system trick in the library.
+**Key DX choices**:
 
-### 2.2 `Permissions<T>` — the returned object
+- `const` type parameter (TS 5.0+) preserves the literal types of every
+  string — no `as const` cargo from the user.
+- Inheritance is declared via `extends: string[]`, **not** by the order keys
+  appear in the object. This makes the policy diffable and re-orderable.
+- Permissions can be expressed in three escalating shapes:
+  - **string array** — implicit `true` (`['read', 'update']`)
+  - **wildcard** — `['*']` expands to every action declared for that resource
+  - **rule object** — `{ create: true, update: { when: 'isOwner' } }`
+- Conditions are referenced **by name** (string) so the policy stays
+  serialisable (audit-friendly) and conditions can be injected/swapped at
+  enforcer-creation time for testing.
 
-The full API uses **a single object-shaped argument** (`CheckArgs`) on
-every check site — `Permissions` and `Ability` agree on call shape so
-there is no `(action, resource)` vs `(resource, action)` confusion to
-remember.
-
-```ts
-export interface Permissions<
-  TPolicy extends PolicyDefinition,
-  TInstances extends ResourceInstanceMap<TPolicy> = DefaultInstances<TPolicy>,
-> {
-  /**
-   * Synchronous permission check. Returns a fully-described `Decision`.
-   *
-   * `action` is constrained at compile time to the actions declared on the
-   * supplied `resource` — `check({ resource: 'post', action: 'foo' })`
-   * is a TS error.
-   *
-   * Use this when the caller expects a structured result (logging,
-   * field-filtering, returning `403` with a reason).
-   */
-  check<
-    R extends InferResources<TPolicy>,
-    A extends InferActions<TPolicy, R>,
-  >(args: CheckArgs<TPolicy, R, A, TInstances>): Decision;
-
-  /**
-   * Async variant. Use when at least one applicable rule has an
-   * `async` condition (e.g. DB lookup of membership).
-   */
-  checkAsync<
-    R extends InferResources<TPolicy>,
-    A extends InferActions<TPolicy, R>,
-  >(args: CheckArgs<TPolicy, R, A, TInstances>): Promise<Decision>;
-
-  /** Sugar over `check(...).allowed`. */
-  can<
-    R extends InferResources<TPolicy>,
-    A extends InferActions<TPolicy, R>,
-  >(args: CheckArgs<TPolicy, R, A, TInstances>): boolean;
-
-  /** Sugar over `!check(...).allowed`. */
-  cannot<
-    R extends InferResources<TPolicy>,
-    A extends InferActions<TPolicy, R>,
-  >(args: CheckArgs<TPolicy, R, A, TInstances>): boolean;
-
-  /** Throws `PermissionError` if denied. */
-  enforce<
-    R extends InferResources<TPolicy>,
-    A extends InferActions<TPolicy, R>,
-  >(args: CheckArgs<TPolicy, R, A, TInstances>): void;
-
-  /**
-   * Returns an `Ability` bound to a given subject. Use inside
-   * request handlers to avoid passing `subject` to every check, and to
-   * enable per-request memoization (the same `subject` evaluated twice
-   * for the same `(resource, action)` reuses the cached decision —
-   * conditions excluded).
-   *
-   * The return type is named `Ability` (not `ScopedAbility`) to match
-   * the verb of the factory and CASL precedent.
-   */
-  abilityFor(
-    subject: Subject<InferRoles<TPolicy>>,
-  ): Ability<TPolicy, TInstances>;
-
-  /** Returns a new `Permissions` with the audit hook attached. Original is unchanged. */
-  withAudit(hook: AuditHook): Permissions<TPolicy, TInstances>;
-
-  /** Read-only access to the frozen, normalized policy (debugging/tests). */
-  readonly policy: Readonly<TPolicy>;
-}
-```
-
-> `serialize()` is **not** an instance method — it is a free function
-> exported from the root entry, `serialize(permissions)`. This lets the
-> 95 % of callers who never serialize their policy tree-shake it out of
-> the bundle. Conditions are still dropped from the output (server-side
-> only). See §3.1.
-
-### 2.3 `Ability<T>` — per-subject convenience (object-arg API)
-
-`Ability<T>` mirrors `Permissions` exactly minus `subject` — same
-`{ resource, action, target?, context? }` object shape on every call site.
-
-```ts
-export type AbilityCheckArgs<
-  TPolicy extends PolicyDefinition,
-  R extends InferResources<TPolicy>,
-  A extends InferActions<TPolicy, R>,
-  TInstances extends ResourceInstanceMap<TPolicy>,
-> = Omit<CheckArgs<TPolicy, R, A, TInstances>, 'subject'>;
-
-export interface Ability<
-  TPolicy extends PolicyDefinition,
-  TInstances extends ResourceInstanceMap<TPolicy> = DefaultInstances<TPolicy>,
-> {
-  readonly subject: Subject<InferRoles<TPolicy>>;
-
-  can<
-    R extends InferResources<TPolicy>,
-    A extends InferActions<TPolicy, R>,
-  >(args: AbilityCheckArgs<TPolicy, R, A, TInstances>): boolean;
-
-  cannot<
-    R extends InferResources<TPolicy>,
-    A extends InferActions<TPolicy, R>,
-  >(args: AbilityCheckArgs<TPolicy, R, A, TInstances>): boolean;
-
-  check<
-    R extends InferResources<TPolicy>,
-    A extends InferActions<TPolicy, R>,
-  >(args: AbilityCheckArgs<TPolicy, R, A, TInstances>): Decision;
-
-  /** Throws `PermissionError` if denied. */
-  enforce<
-    R extends InferResources<TPolicy>,
-    A extends InferActions<TPolicy, R>,
-  >(args: AbilityCheckArgs<TPolicy, R, A, TInstances>): void;
-
-  /**
-   * Returns the array of fields the subject is allowed to read/write
-   * for the given (action, resource), or `'*'` for full access.
-   */
-  fieldsFor<
-    R extends InferResources<TPolicy>,
-    A extends InferActions<TPolicy, R>,
-  >(args: { resource: R; action: A }): readonly string[] | '*';
-}
-```
-
-> Why an object: the object shape lets us add fields (`reason`, `at`,
-> `meta`) later without breaking signatures, is refactor-safe, and
-> eliminates the `(action, resource)` argument-order trap (CASL
-> ordering vs. accesscontrol ordering — neither is "industry standard").
-
-### 2.4 `Subject<TRole>`
+### 2.2 `createEnforcer` — the per-request decision engine
 
 ```ts
 /**
- * The actor performing the action.
+ * Bind a policy to runtime concerns (audit hook, condition overrides, role
+ * resolver). The returned enforcer is **stateless** apart from a private
+ * memoisation cache for the effective-permissions table.
  *
- * `tenantId` is **optional in the type** but **required at runtime under
- * default `strictTenant: true`** (see §4.2 `PolicyOptions`). Single-tenant
- * apps set `strictTenant: false` once at policy definition time and stop
- * threading the tenant through every call.
+ * Safe to construct once at module load and reuse across requests in any
+ * runtime (Node, Edge, Workers).
  *
- * Cross-tenant access (super-admin) is **not expressible via a stringly
- * typed sentinel**. It requires both:
- *
- * 1. `PolicyOptions.allowCrossTenant: true` at policy-construction time
- *    (default `false` — opt-in, not opt-out).
- * 2. `subject.crossTenant === true` on the individual subject.
- *
- * Both gates must agree. This forces an intentional, code-reviewable opt-in
- * — a leaked / mirrored user-controlled string can no longer escalate
- * privileges by reaching `subject.tenantId`. Audit events for crossing
- * tenants always include `crossTenant: true` and the granting policy id.
+ * @example
+ *   export const enforcer = createEnforcer(policy, {
+ *     audit: (event) => logger.info({ msg: 'authz', ...event }),
+ *   });
  */
-export interface Subject<TRole extends string = string> {
-  /** Stable user identifier. Used by conditions and audit logs. */
-  id: string;
+export function createEnforcer<P extends PolicySpec>(
+  policy: Policy<P>,
+  options?: EnforcerOptions<P>,
+): Enforcer<P>;
+
+export interface EnforcerOptions<P extends PolicySpec> {
+  /** Replace or extend conditions defined in the policy (e.g. for tests). */
+  conditions?: Partial<InferConditionMap<P>>;
+  /** Audit hook called after every check (sync or async, fire-and-forget). */
+  audit?: AuditHook;
+  /** Cache size for the effective-permissions LRU (default 256). */
+  cacheSize?: number;
+  /**
+   * If `true`, throws {@link PermissionError} `TENANT_REQUIRED` when a check
+   * is performed without a `tenantId` on the subject AND the resource. Default
+   * `true` — the whole point of this library is that tenant-leakage is a
+   * compile-time and run-time error.
+   */
+  strictTenant?: boolean;
+}
+```
+
+The `Enforcer<P>` instance exposes a small, intention-revealing surface:
+
+```ts
+export interface Enforcer<P extends PolicySpec> {
+  /**
+   * Allow / deny decision with full type-safety on action and resource.
+   * Returns a `boolean` for the synchronous fast-path (when no async condition
+   * applies) or `Promise<boolean>` when the relevant rule needs to evaluate
+   * an `AsyncConditionFn`. Use {@link Enforcer.checkAsync} when you always
+   * want a Promise (tRPC/Next.js handlers usually do).
+   */
+  check<R extends InferResources<P>, A extends InferActions<P, R>>(
+    args: CheckArgs<P, R, A>,
+  ): boolean | Promise<boolean>;
+
+  /** Always-async variant. Recommended for I/O-bound conditions. */
+  checkAsync<R extends InferResources<P>, A extends InferActions<P, R>>(
+    args: CheckArgs<P, R, A>,
+  ): Promise<boolean>;
 
   /**
-   * Tenant the subject is acting on behalf of. Required when
-   * `strictTenant: true` (default). When omitted under
-   * `strictTenant: false`, the tenant guard is bypassed entirely.
+   * Same as {@link check} but throws {@link PermissionError} (`FORBIDDEN`)
+   * on deny. Useful at API boundaries to short-circuit handlers without
+   * branching.
+   */
+  authorize<R extends InferResources<P>, A extends InferActions<P, R>>(
+    args: CheckArgs<P, R, A>,
+  ): void | Promise<void>;
+
+  /**
+   * Inspectable explain — returns the decision plus the rule that produced it,
+   * the role it came from, and the conditions evaluated. Designed for audit
+   * logs and test assertions, not for hot paths.
+   */
+  explain<R extends InferResources<P>, A extends InferActions<P, R>>(
+    args: CheckArgs<P, R, A>,
+  ): Decision<P, R, A> | Promise<Decision<P, R, A>>;
+
+  /** Returns the (non-frozen, deep-cloned) effective-permission set. */
+  permissionsOf(roles: ReadonlyArray<InferRoles<P>>): EffectivePermissions<P>;
+
+  /** Reference back to the policy (frozen). */
+  readonly policy: Policy<P>;
+}
+```
+
+`CheckArgs` collects every input the engine needs:
+
+```ts
+export interface CheckArgs<
+  P extends PolicySpec,
+  R extends InferResources<P>,
+  A extends InferActions<P, R>,
+> {
+  /** Caller — must always carry roles and (in strictTenant mode) tenantId. */
+  subject: Subject<InferRoles<P>>;
+  /** Action being attempted on `resource`. */
+  action: A;
+  /** Resource type — string literal must match a declared resource. */
+  resource: R;
+  /** Optional resource instance for ABAC conditions (ownership, tenancy). */
+  data?: ResourceData;
+  /**
+   * Tenant scope of the check. Defaults to `subject.tenantId`. Passing a
+   * different value triggers `TENANT_MISMATCH` unless the subject has a role
+   * marked `crossTenant: true` in the policy (rare, audit-flagged).
    */
   tenantId?: string;
-
-  /** Roles assigned to this subject *for this tenantId*. */
-  roles: readonly TRole[];
-
-  /**
-   * Opt-in cross-tenant flag. Setting `true` is a no-op unless the policy
-   * was constructed with `PolicyOptions.allowCrossTenant: true`. Even
-   * then, every cross-tenant call is recorded in audit with `crossTenant: true`.
-   */
-  crossTenant?: true;
-
-  /** Optional bag for ABAC conditions (department, region, plan, ...). */
-  attributes?: Readonly<Record<string, unknown>>;
 }
 ```
 
-### 2.5 `CheckArgs` and `Decision`
+### 2.3 Top-level conveniences
 
 ```ts
-/**
- * Argument shape for `check()`/`can()`. The shape is conditional:
- * - `resource` is constrained to the policy's resource keys
- * - `action`   is constrained to that resource's actions
- * - `target`   is the *resource instance*, narrowed via `TInstances[R]`
- * - `context`  is a free-form bag passed through to conditions
- */
-export interface CheckArgs<
-  TPolicy extends PolicyDefinition,
-  R extends InferResources<TPolicy>,
-  A extends InferActions<TPolicy, R>,
-  TInstances extends ResourceInstanceMap<TPolicy> = DefaultInstances<TPolicy>,
-> {
-  subject: Subject<InferRoles<TPolicy>>;
-  resource: R;
-  action: A;
-  /** The concrete resource instance, typed as `TInstances[R]` (e.g. `Post`). */
-  target?: TInstances[R];
-  /** Free-form context bag passed verbatim to condition functions. */
-  context?: Readonly<Record<string, unknown>>;
-}
+/** Construct a properly-typed Subject. Pure helper — no state. */
+export function createSubject<TRole extends string>(
+  init: { id: string; roles: ReadonlyArray<TRole>; tenantId?: string; attrs?: Record<string, unknown> },
+): Subject<TRole>;
 
-export interface ResourceInstance {
-  /** When present, enables built-in tenant-mismatch detection. */
-  readonly tenantId?: string;
-  readonly [k: string]: unknown;
-}
+/** Compose multiple audit hooks into one (left-to-right). */
+export function composeAudit(...hooks: AuditHook[]): AuditHook;
 
-export interface Decision {
-  /** Final verdict. `false` means: do not perform the action. */
-  readonly allowed: boolean;
-
-  /** Why we decided this way — drives logs, error messages, debugging. */
-  readonly reason: DecisionReason;
-
-  /** The single rule that produced the verdict, if any. */
-  readonly matchedRule?: Readonly<{
-    role: string;
-    resource: string;
-    action: string;
-    effect: 'allow' | 'deny';
-    priority?: number;
-    description?: string;
-  }>;
-
-  /** Field whitelist, if the matched rule constrains attributes. Always non-empty if present (§9.3 #20). */
-  readonly fields?: readonly string[];
-
-  /** Wall-clock time of the decision (audit/perf). */
-  readonly durationMs?: number;
-}
-
-export type DecisionReason =
-  | 'allowed_by_rule'
-  | 'denied_by_rule'
-  | 'no_matching_rule'
-  | 'condition_failed'
-  | 'condition_threw'
-  | 'tenant_mismatch'
-  | 'cross_tenant_disallowed'
-  | 'subject_has_no_roles';
+/** Re-exports from sub-barrels for convenience (tree-shakeable). */
+export { PermissionError, ERROR_CODES } from './errors';
+export type * from './types';
 ```
 
-### 2.6 Builder (advanced / dynamic) — separate subpath
+### 2.4 Adapters — minimal, framework-idiomatic
 
-The imperative builder is a niche escape hatch (~5 % of users) but has
-mutable state and method chaining that bloat the bundle. To keep the
-core under 5 KB it lives at its own subpath, **`@authkit/permissions/builder`**:
+Every adapter is **thin**: it converts the framework's request/context to a
+`Subject`, calls `enforcer.authorize(...)`, and lets the framework handle the
+thrown `PermissionError` via its own error pipeline.
 
-```ts
-// src/builder/index.ts
-import { AbilityBuilder } from '@authkit/permissions/builder';
-
-const permissions = new AbilityBuilder()
-  .role('admin', { extends: ['member'] })
-  .resource('post', ['read', 'create', 'update', 'delete'])
-  .allow('admin', 'post', '*')
-  .deny('admin', 'post', 'delete')
-  .build();
-```
+#### Hono
 
 ```ts
-export declare class AbilityBuilder<
-  TRole extends string = string,
-  TResource extends string = string,
-  TAction extends string = string,
-> {
-  role(name: TRole, opts?: { extends?: readonly TRole[] }): this;
-  resource(name: TResource, actions: readonly TAction[]): this;
-  allow(role: TRole, resource: TResource | '*', action: TAction | '*'): this;
-  deny(role: TRole, resource: TResource | '*', action: TAction | '*'): this;
-  when(condition: ConditionFn): this; // attaches to the last rule
-  priority(value: number): this;       // attaches to the last rule
-  build(): Permissions<PolicyDefinition<TRole, TResource, TAction>>;
-}
-```
+import { createHonoMiddleware } from '@authkit/permissions/adapters/hono';
 
-### 2.7 Audit hook
-
-```ts
-/**
- * Called once per `check()`/`checkAsync()` after a decision is made.
- * Behaviour when the hook throws is governed by `PolicyOptions.auditFailureMode`:
- *   - `'log'`   (default) — error swallowed, logged via `console.warn`,
- *                           decision returned unchanged. Use for UI gating.
- *   - `'throw'` — error rethrown wrapped in `AuditError`. Caller decides.
- *   - `'deny'`  — decision is forced to `{ allowed: false, reason: 'condition_threw' }`,
- *                 no exception bubbles. Strictest fail-closed mode for SOC2 shops
- *                 where a broken audit pipeline must fail the request.
- */
-export type AuditHook = (event: AuditEvent) => void | Promise<void>;
-
-export interface AuditEvent {
-  readonly subject: Subject;
-  readonly action: string;
-  readonly resource: string;
-  readonly target?: ResourceInstance;
-  readonly tenantId?: string;
-  readonly crossTenant?: true;
-  readonly decision: Decision;
-  readonly timestamp: string; // ISO 8601
-}
-
-/** Built-ins. */
-export declare function noopAudit(): AuditHook;
-export declare function consoleAudit(opts?: { level?: 'info' | 'debug' }): AuditHook;
-```
-
-### 2.8 Adapters — DX examples (consistent naming)
-
-All server framework adapters expose a **`<framework>Permissions()`**
-factory function for the request-level middleware. Per-route helpers
-keep the verbs `protect*` / `require*`.
-
-| Framework | Middleware factory   | Per-route helper          |
-|-----------|----------------------|---------------------------|
-| Next.js   | `nextPermissions()`  | `protectRoute()`          |
-| Hono      | `honoPermissions()`  | `c.var.enforce(...)`      |
-| Express   | `expressPermissions()` | `requirePermission()`   |
-| Fastify   | `fastifyPermissions()` (plugin) | `requirePermission()` |
-| NestJS    | `PermissionsModule.forRoot()` | `@RequirePermission()` + `PermissionsGuard` |
-| tRPC      | `trpcPermissions()`  | `createProtectedProcedure()` |
-
-#### Next.js App Router
-
-```ts
-// app/api/posts/[id]/route.ts
-import { protectRoute } from '@authkit/permissions/adapters/next';
-import { permissions } from '@/lib/permissions';
-
-export const DELETE = protectRoute(
-  permissions,
-  { action: 'delete', resource: 'post' },
-  async (req, { params, subject }) => {
-    await deletePost(params.id);
-    return Response.json({ ok: true });
-  },
+app.use(
+  '/api/*',
+  createHonoMiddleware(enforcer, {
+    getSubject: (c) => c.var.user,                  // your auth result
+    require: (c) => ({ resource: 'document', action: 'read' }),
+  }),
 );
 ```
 
-#### Hono (Edge)
+#### Next.js (App Router)
 
 ```ts
-import { Hono } from 'hono';
-import { honoPermissions } from '@authkit/permissions/adapters/hono';
-import { permissions } from './permissions';
+// app/api/documents/[id]/route.ts
+import { withPermissions } from '@authkit/permissions/adapters/next';
 
-const app = new Hono();
-app.use('*', honoPermissions({
-  permissions,
-  getSubject: (c) => c.get('user'),
-}));
-app.delete('/posts/:id', async (c) => {
-  c.var.enforce({ action: 'delete', resource: 'post', target: { id: c.req.param('id') } });
-  // ...
-});
+export const GET = withPermissions(
+  enforcer,
+  { resource: 'document', action: 'read' },
+  async (req, { params, subject }) => Response.json(await load(params.id)),
+);
 ```
 
 #### tRPC
 
 ```ts
-import { createProtectedProcedure } from '@authkit/permissions/adapters/trpc';
-const protectedProcedure = createProtectedProcedure({ permissions });
+import { createPermissionsMiddleware } from '@authkit/permissions/adapters/trpc';
 
-export const postRouter = t.router({
-  delete: protectedProcedure
-    .require({ action: 'delete', resource: 'post' })
+export const requires = createPermissionsMiddleware(t, enforcer);
+
+export const documentsRouter = t.router({
+  delete: t.procedure
+    .use(requires({ resource: 'document', action: 'delete' }))
     .input(z.object({ id: z.string() }))
-    .mutation(({ input }) => deletePost(input.id)),
+    .mutation(({ ctx, input }) => repo.delete(input.id)),
 });
 ```
 
 #### NestJS
 
 ```ts
-@Controller('posts')
-export class PostsController {
-  @Delete(':id')
-  @RequirePermission({ action: 'delete', resource: 'post' })
-  @UseGuards(PermissionsGuard)
-  delete(@Param('id') id: string) { /* ... */ }
+@Controller('documents')
+@UseGuards(PermissionsGuard)
+export class DocumentsController {
+  @Get(':id')
+  @Requires({ resource: 'document', action: 'read' })
+  read(@Param('id') id: string) { /* … */ }
 }
 ```
 
 #### React
 
 ```tsx
-import { PermissionsProvider, useCan, Can } from '@authkit/permissions/react';
+import { PermissionProvider, useCan, Can } from '@authkit/permissions/react';
 
-<PermissionsProvider permissions={permissions} subject={currentUser}>
-  <Can action="delete" resource="post" target={post}>
-    <DeleteButton/>
+<PermissionProvider enforcer={enforcer} subject={subject}>
+  <Can action="delete" resource="document" data={doc} fallback={<Disabled />}>
+    <DeleteButton />
   </Can>
-  <Can action="publish" resource="post" fallback={<UpgradeBanner/>}>
-    <PublishButton/>
-  </Can>
-</PermissionsProvider>
-
-const canEdit = useCan({ action: 'update', resource: 'post', target: post }); // boolean
-```
-
-### 2.9 ORM / query-builder integration — `accessibleBy()`
-
-`accessibleBy(ability, resource)` returns a **normalized filter AST**
-that adapters under `@authkit/permissions/orm/{prisma,drizzle,mongoose}`
-translate to the host's native `where`. This pushes authorization into
-SQL/Mongo so `findMany` returns *only* rows the subject is allowed to
-see (the row-level enforcement story SOC2 actually cares about — and
-the single biggest reason CASL retains users today).
-
-```ts
-// Generic AST (what `accessibleBy` returns).
-export type AccessibleByFilter =
-  | { kind: 'all' }                             // unconstrained
-  | { kind: 'none' }                            // empty result set
-  | { kind: 'and'; filters: AccessibleByFilter[] }
-  | { kind: 'or';  filters: AccessibleByFilter[] }
-  | { kind: 'eq';  field: string; value: unknown }
-  | { kind: 'in';  field: string; values: readonly unknown[] };
-
-export declare function accessibleBy<
-  TPolicy extends PolicyDefinition,
-  R extends InferResources<TPolicy>,
-  TInstances extends ResourceInstanceMap<TPolicy>,
->(
-  ability: Ability<TPolicy, TInstances>,
-  args: { resource: R; action?: InferActions<TPolicy, R> },
-): AccessibleByFilter;
+</PermissionProvider>
 ```
 
 ```ts
-// @authkit/permissions/orm/prisma
-import { accessibleBy } from '@authkit/permissions';
-import { toPrisma } from '@authkit/permissions/orm/prisma';
-
-const filter = toPrisma(accessibleBy(ability, { resource: 'post', action: 'read' }));
-const posts  = await prisma.post.findMany({ where: filter });
+const allowed = useCan('update', 'document', doc);
 ```
+
+### 2.5 ORM role adapters
+
+Out-of-the-box helpers to load `roles` and `tenantId` for a user from a typical
+`memberships` table — pure functions, no decorators, no global registration.
 
 ```ts
-// @authkit/permissions/orm/drizzle
-import { toDrizzle } from '@authkit/permissions/orm/drizzle';
-const where = toDrizzle(accessibleBy(ability, { resource: 'post' }), posts);
-const rows  = await db.select().from(posts).where(where);
+import { createPrismaRoleAdapter } from '@authkit/permissions/orm/prisma';
+
+const roleAdapter = createPrismaRoleAdapter(prisma, {
+  membershipModel: 'membership',
+  userField: 'userId',
+  tenantField: 'tenantId',
+  roleField: 'role',
+});
+
+const subject = await roleAdapter.loadSubject({ userId, tenantId });
 ```
-
-```ts
-// @authkit/permissions/orm/mongoose
-import { toMongo } from '@authkit/permissions/orm/mongoose';
-const filter = toMongo(accessibleBy(ability, { resource: 'post' }));
-const docs   = await Post.find(filter);
-```
-
-**Translation rules** (and what is NOT supported):
-
-- Built-in tenant guard always emits `{ kind: 'eq', field: 'tenantId', value: subject.tenantId }`
-  (or short-circuits to `{ kind: 'all' }` when `crossTenant: true` and `allowCrossTenant: true`).
-- Conditions referencing only the subject (e.g. `target.authorId === subject.id`)
-  compile to `{ kind: 'eq', field: 'authorId', value: subject.id }` via a **declarative
-  condition shape** (helpers like `eq('authorId', ({subject}) => subject.id)`).
-  Conditions that are arbitrary user-supplied functions are **opaque**: they are
-  enforced row-by-row at evaluation time and the AST falls back to `{ kind: 'all' }`
-  with a `Decision.warning` so the caller knows post-filtering is required.
-- Empty intersection (deny-overrides + no allow rule) compiles to `{ kind: 'none' }`,
-  which adapters translate to a SQL `false` predicate / `_id: { $in: [] }` so the
-  query returns zero rows without a round trip.
 
 ---
 
 ## 3. Internal Architecture
 
-### 3.1 Module dependency graph (core)
+### 3.1 Module dependency graph
 
 ```
-                 +------------------+
-                 |  define-policy   |
-                 +--------+---------+
-                          |
-            +-------------+-------------+
-            |             |             |
-            v             v             v
-      +-----+-----+ +-----+-----+ +-----+-----+
-      | role-graph| |  matcher  | |  freeze   |
-      +-----+-----+ +-----+-----+ +-----------+
-            \             /
-             \           /
-              v         v
-          +---+---------+--+
-          |   evaluator    |  <-- pure decision engine
-          +---+----+-------+
-              |    |
-              |    +--> condition (sync/async wrapper)
-              |    +--> tenant     (cross-tenant short-circuit, gated)
-              v
-          +---+---+
-          | decision (Decision factory + reason codes)
-          +---+---+
-              |
-              v
-        +-----+------+
-        | permissions| (check / checkAsync / can / enforce / abilityFor)
-        +-----+------+
-              |
-              v
-      +-------+--------+
-      |    ability     | (subject-scoped wrapper + memoization)
-      +-------+--------+
-              |
-              v
-      +-------+--------+
-      | accessible-by  |  (Ability -> AccessibleByFilter AST)
-      +----------------+
+                        index.ts
+                            │
+            ┌───────────────┴────────────────┐
+            ▼                                ▼
+       core/policy.ts                  core/enforcer.ts
+            │                                │
+            ├──► role-graph.ts               ├──► effective.ts ──► memo.ts
+            ├──► matcher.ts                  ├──► matcher.ts
+            ├──► conditions.ts               ├──► conditions.ts
+            └──► freeze.ts                   ├──► role-graph.ts (transitive set)
+                                             ├──► audit/hook.ts (optional inject)
+                                             └──► errors/base.ts
 
-serialize    <-- free function in core/serialize.ts (NOT on Permissions interface)
-audit/hook   <-- attached via permissions.withAudit(); called by permissions
-errors/*     <-- thrown by define-policy + permissions.enforce()
-utils/*      <-- consumed by everyone, exports nothing publicly
-utils/env.ts <-- the ONLY module that touches `process` / `globalThis`
-builder/*    <-- subpath-only; depends on core but core never imports it
-orm/*        <-- subpath-only; depends on accessible-by; framework-typed
+types/* — type-only, never imported at runtime
+errors/* — leaf, no internal deps
+audit/* — leaf, depends only on types
+builder/* — depends on core/policy.ts (just calls definePolicy() at end)
+adapters/*  — depend on core (Enforcer interface) + framework peer dep
+orm/*       — depend on core/types only + ORM peer dep
+react/vue   — depend on core types + React/Vue peer dep
 ```
 
-Rules of dependency:
+There are **no circular imports** by construction. CI fails if `madge --circular`
+reports anything in `src/`.
 
-1. `core/*` may not import from `adapters/*`, `react/*`, `vue/*`, `audit/*`,
-   `builder/*`, `orm/*`.
-2. `adapters/*` may import from `core/*` and `errors/*` only.
-3. `react/*` and `vue/*` import from `core/*`, `errors/*`, `audit/*`.
-4. `orm/*` may import from `core/*` and `errors/*` only.
-5. `builder/*` may import from `core/*` and `errors/*` only.
-6. `types/*` has zero runtime cost — `import type` only.
-7. Cycles between `core/*` modules are forbidden (lint rule).
-8. Direct reads of `process.env`, `globalThis.process`, etc. are
-   **forbidden everywhere** outside `utils/env.ts`. A Biome rule enforces
-   this; CI fails on violation.
-
-### 3.2 Data flow — a single `check()`
+### 3.2 Data flow for a single `enforcer.check(...)` call
 
 ```
-caller                                          permissions.check
-  |                                                     |
-  | { subject, resource, action, target, context }      |
-  +---->----+                                           |
-            v                                           |
-       +----+--------------+                            |
-       | tenant guard      |  --(mismatch)--> Decision{ tenant_mismatch }
-       |                   |  --(crossTenant + allowed)-->                   |
-       +----+--------------+                            |
-            |                                           |
-            v                                           |
-       +----+--------------+                            |
-       | role-graph expand |  subject.roles -> effectiveRoles[] (with extends)
-       +----+--------------+                            |
-            |                                           |
-            v                                           |
-       +----+--------------+                            |
-       | rule index lookup |  O(1) by (role, resource, action)
-       +----+--------------+                            |
-            |                                           |
-            v                                           |
-       +----+--------------+                            |
-       | evaluator         |  precedence-aware (deny|allow), priority-sorted,
-       |   (filters by     |  insertion-order tiebreak; conditions evaluated
-       |    condition)     |  lazily.                                       |
-       +----+--------------+                            |
-            |                                           |
-            v                                           |
-       +----+--------------+                            |
-       | decision builder  |  -> Decision               |
-       +----+--------------+                            |
-            |                                           |
-            v                                           |
-       +----+--------------+                            |
-       | audit hook (opt)  |  -> per auditFailureMode   |
-       +----+--------------+                            |
-            |                                           |
-            v                                           |
-        Decision                                        |
-            +-------->--------------------------->------+
+user code
+   │
+   │ check({ subject, action, resource, data, tenantId? })
+   ▼
+enforcer.check
+   │ 1. validate args (cheap shape check, dev-only assert)
+   │ 2. tenant guard (strictTenant ? require subject.tenantId)
+   │ 3. resolveEffectivePermissions(subject.roles)   ◄── memoised
+   │       (role-graph closure → flat permission map)
+   │ 4. matcher.match(action, resource) over effective rules
+   │       → either: deny | allow-unconditional | allow-with-condition[]
+   │ 5. if conditions → evaluate (sync first; promote to async only
+   │       when at least one is AsyncConditionFn)
+   │ 6. emit AuditEvent { subject, action, resource, allowed, reason, ... }
+   │ 7. return boolean | Promise<boolean>
+   ▼
+caller
 ```
 
 ### 3.3 Key design patterns
 
-- **Builder + immutability** — `definePolicy()` returns a frozen object;
-  mutating helpers (`withAudit`) return new instances.
-- **Strategy** — `evaluator` separates the decision algorithm from the
-  rule store; we ship `precedence: 'deny'` (default) and `'allow'` behind
-  the same option.
-- **Adapter** — every framework integration is a thin bridge that
-  unwraps host-specific request shape into a `CheckArgs` and forwards
-  to `permissions.enforce`.
-- **Phantom types** — `Permissions<TPolicy, TInstances>` carries the policy
-  literal as a phantom type parameter; runtime never sees `TPolicy`.
-- **Memoization (WeakMap)** — `abilityFor(subject)` caches per-subject
-  decision results keyed by `(resource, action)`; cleared automatically
-  when the subject is GC'd. Conditions short-circuit memoization.
-- **Index-by-tuple** — at construction time we precompute a `Map` keyed
-  by ``${role}|${resource}|${action}`` so lookups are O(1).
-- **Free functions for tree-shaking** — `serialize(permissions)` and
-  `accessibleBy(ability, ...)` are top-level functions, not methods, so
-  bundlers strip them when unused.
+- **Pure factory + frozen value.** `definePolicy` and `createEnforcer` produce
+  immutable data — no method on a returned object mutates `this`. Makes the
+  library trivially safe to share across async work and across Workers
+  isolates.
+- **Compile-once, decide-many.** Role hierarchy is flattened to a transitive
+  closure inside `definePolicy`; per-role permission lookup is then O(1).
+- **Memoised effective-permissions table.** Tiny LRU keyed by sorted role-set
+  hash — turns `check` into amortised constant time even with deep
+  inheritance.
+- **String-name conditions, function bodies.** The policy literal stays
+  data — fully serialisable for audit dumps and easily diffable in PRs.
+  Function bodies live alongside but are referenced by name. Tests can
+  override individual conditions without rewriting the policy.
+- **Adapters as thin glue.** Adapters never re-implement decision logic —
+  they only translate framework primitives into `CheckArgs`.
+- **Type inference is the spec.** The "API surface" presented to a user's IDE
+  *is* their policy. We invest heavily in §4 to make that surface accurate
+  and ergonomic.
 
 ---
 
 ## 4. Type System
 
-### 4.1 Inference helpers
+The whole library is built around one principle: **the policy literal is the
+source of truth for every type the user touches**. We never ask the user to
+duplicate a string in a TS generic.
+
+### 4.1 Core type primitives
 
 ```ts
-/** All role names declared in a policy literal. */
-export type InferRoles<P extends PolicyDefinition> =
-  keyof P['roles'] & string;
+// types/policy.ts
+export type ActionString = string;
+export type ResourceString = string;
+export type RoleString = string;
+export type ConditionName = string;
 
-/** All resource names declared in a policy literal. */
-export type InferResources<P extends PolicyDefinition> =
-  keyof P['resources'] & string;
+export interface RoleDef<TRole extends RoleString = RoleString> {
+  /** Roles this role inherits permissions from. */
+  readonly extends?: ReadonlyArray<TRole>;
+  /** Optional human-readable description for audit/UX. */
+  readonly description?: string;
+  /** Allow checks across tenants. Default false. Audit-flagged when true. */
+  readonly crossTenant?: boolean;
+}
 
-/** Actions declared on a specific resource. */
+export interface ResourceDef<TAction extends ActionString = ActionString> {
+  readonly actions: ReadonlyArray<TAction>;
+  readonly description?: string;
+}
+
+export type RuleDef<TCond extends ConditionName = ConditionName> =
+  | true
+  | { readonly when: TCond | ReadonlyArray<TCond> }   // AND
+  | { readonly anyOf: ReadonlyArray<TCond> }          // OR
+  | { readonly not: TCond | RuleDef<TCond> };         // NEGATION
+
+export type ResourcePermissions<
+  R extends ResourceDef,
+  TCond extends ConditionName,
+> =
+  | ReadonlyArray<R['actions'][number] | '*'>
+  | { readonly [A in R['actions'][number]]?: RuleDef<TCond> }
+  | { readonly '*'?: RuleDef<TCond> };
+
+export interface PolicySpec {
+  readonly version?: string;
+  readonly roles: { readonly [R in string]: RoleDef<string> };
+  readonly resources: { readonly [Res in string]: ResourceDef };
+  readonly conditions?: { readonly [C in string]: ConditionFn | AsyncConditionFn };
+  readonly permissions: {
+    readonly [R in string]?: {
+      readonly [Res in string]?: ResourcePermissions<ResourceDef, string>;
+    };
+  };
+}
+
+/** Result of `definePolicy(spec)`. Carries the literal `P` for inference. */
+export interface Policy<P extends PolicySpec> {
+  readonly spec: P;
+  /** Branded so `Policy<A>` is not assignable to `Policy<B>`. */
+  readonly __brand: 'authkit/policy';
+}
+```
+
+### 4.2 Inference helpers (the "magic")
+
+```ts
+// types/inference.ts
+
+/** Union of every role name declared in a policy. */
+export type InferRoles<P extends PolicySpec> = keyof P['roles'] & string;
+
+/** Union of every resource name. */
+export type InferResources<P extends PolicySpec> = keyof P['resources'] & string;
+
+/** Union of every action declared for resource R. */
 export type InferActions<
-  P extends PolicyDefinition,
+  P extends PolicySpec,
   R extends InferResources<P>,
-> = P['resources'][R] extends { actions: readonly (infer A)[] }
-  ? A & string
-  : never;
+> = P['resources'][R] extends ResourceDef<infer A> ? A : never;
 
-/** Reverse map: `{ post: 'read'|'create'|...; comment: 'read'|... }`. */
-export type ActionsByResource<P extends PolicyDefinition> = {
-  [R in InferResources<P>]: InferActions<P, R>;
-};
+/** Union of all condition names declared in `conditions`. */
+export type InferConditions<P extends PolicySpec> =
+  P['conditions'] extends Record<string, unknown>
+    ? keyof P['conditions'] & string
+    : never;
 
-/** Per-resource concrete instance shapes (for typed `target`). */
-export type ResourceInstanceMap<P extends PolicyDefinition> = {
-  [R in InferResources<P>]: ResourceInstance;
-};
+/** Map of condition-name → typed function (sync or async). */
+export type InferConditionMap<P extends PolicySpec> =
+  P['conditions'] extends infer C extends Record<string, ConditionFn | AsyncConditionFn>
+    ? { readonly [K in keyof C]: C[K] }
+    : Record<string, never>;
 
-export type DefaultInstances<P extends PolicyDefinition> = {
-  [R in InferResources<P>]: ResourceInstance;
-};
-```
-
-### 4.2 The shape contracts
-
-```ts
-export interface PolicyDefinition<
-  TRole extends string = string,
-  TResource extends string = string,
-  TAction extends string = string,
-> {
-  roles:     Readonly<Record<TRole,     RoleDefinition<TRole>>>;
-  resources: Readonly<Record<TResource, ResourceDefinition<TAction>>>;
-  rules:     ReadonlyArray<Rule<PolicyDefinition<TRole, TResource, TAction>>>;
-  options?:  PolicyOptions;
-}
-
-export interface RoleDefinition<TRole extends string = string> {
-  description?: string;
-  /** Roles this role inherits from. Order is irrelevant; cycles fail at build. */
-  extends?: readonly TRole[];
-}
-
-export interface ResourceDefinition<TAction extends string = string> {
-  description?: string;
-  actions: readonly TAction[];
-}
-
-/**
- * Distributive `Rule<P>` so when `resource` is the literal `'post'`,
- * `action` is constrained to `InferActions<P, 'post'>`. This closes the
- * §4.4 "no string-typed escape hatch" promise: `{ resource: 'billing',
- * action: 'publish' }` is now a TS error if `publish` belongs to `post`.
- */
-export type Rule<P extends PolicyDefinition> =
-  | { [R in InferResources<P>]: RuleFor<P, R> }[InferResources<P>]
-  | WildcardRule<P>;
-
-export type RuleFor<
-  P extends PolicyDefinition,
-  R extends InferResources<P>,
-> = {
-  role:     InferRoles<P> | readonly InferRoles<P>[];
-  resource: R | readonly R[];
-  action:   InferActions<P, R> | readonly InferActions<P, R>[] | '*';
-  /** Default `'allow'`. `'deny'` overrides any allow at the same priority. */
-  effect?:  'allow' | 'deny';
-  condition?: ConditionFn<Subject<InferRoles<P>>, /* target */ never>;
-  /**
-   * Optional whitelist of fields the rule covers. **Empty arrays are
-   * rejected at construction time** with `EMPTY_FIELDS` (§9.3 #20).
-   */
-  fields?:  readonly [string, ...string[]];
-  /**
-   * Higher value wins. Ties broken by insertion order (later overrides
-   * earlier within the same priority bucket). Default `0`. See §9.3 #18.
-   */
-  priority?: number;
-  description?: string;
-};
-
-export type WildcardRule<P extends PolicyDefinition> = {
-  role:     InferRoles<P> | readonly InferRoles<P>[];
-  resource: '*';
-  /** When `resource: '*'`, action MUST be `'*'` — narrowing per resource is undefined. */
-  action:   '*';
-  effect?:  'allow' | 'deny';
-  condition?: ConditionFn;
-  priority?: number;
-  description?: string;
-};
-
-export interface PolicyOptions {
-  /**
-   * Conflict resolution. Renamed from XACML `combiningAlgorithm` to
-   * `precedence` for accessibility (target audience: senior backend devs,
-   * not policy engineers). `'deny'` = deny-overrides (default), `'allow'`
-   * = allow-overrides.
-   */
-  precedence?: 'deny' | 'allow';
-
-  /**
-   * Default `true`. When `true`, `subject.tenantId` is required at runtime
-   * and a missing/empty value yields `tenant_mismatch`. When `false`,
-   * the tenant guard is bypassed entirely (single-tenant mode).
-   */
-  strictTenant?: boolean;
-
-  /**
-   * Default `false`. Cross-tenant access (super-admin) requires this AND
-   * `subject.crossTenant === true`. With this `false`, setting
-   * `crossTenant` on a subject is a no-op. See §2.4.
-   */
-  allowCrossTenant?: boolean;
-
-  /**
-   * Default `'log'`. Behaviour when an audit hook throws/rejects:
-   *   - `'log'`   — swallow + `console.warn` once; decision unchanged.
-   *   - `'throw'` — rethrow as `AuditError` (caller decides).
-   *   - `'deny'`  — force the decision to `{ allowed: false, reason: 'condition_threw' }`.
-   */
-  auditFailureMode?: 'log' | 'throw' | 'deny';
-
-  /** Throw at definition time if rules reference unknown ids. Default `true`. */
-  strictReferences?: boolean;
-}
-```
-
-### 4.3 Condition function (per-resource target typing)
-
-```ts
-export type ConditionFn<
-  TSubject extends Subject = Subject,
-  TTarget = ResourceInstance,
-  TCtx extends Record<string, unknown> = Record<string, unknown>,
-> = (args: ConditionArgs<TSubject, TTarget, TCtx>) => boolean | Promise<boolean>;
-
-export interface ConditionArgs<TSubject, TTarget, TCtx> {
-  readonly subject: TSubject;
-  readonly target?: TTarget;
-  readonly context: Readonly<TCtx>;
+/** Subject type carrying compile-time-validated role union. */
+export interface Subject<TRole extends RoleString = RoleString> {
+  readonly id: string;
+  readonly roles: ReadonlyArray<TRole>;
   readonly tenantId?: string;
-  /** Stable monotonic clock for deterministic time-based rules in tests. */
-  readonly now: () => Date;
+  readonly attrs?: Readonly<Record<string, unknown>>;
 }
 ```
 
-When the consumer supplies `TInstances` to `definePolicy<TPolicy,
-TInstances>`, the `target` parameter inside a rule's `condition` is
-typed to `TInstances[Rule['resource']]` — so a rule with `resource: 'post'`
-gets `target?: Post`, not the catch-all `ResourceInstance`. This is the
-ABAC ergonomics story; conditions stop being a stringly-typed black box.
+### 4.3 Compile-time invariants (what the type system enforces)
 
-### 4.4 Compile-time guarantees
+| Mistake | Caught by | Diagnostic |
+|---|---|---|
+| `enforcer.check({ resource: 'documnt', action: 'read' })` | `R extends InferResources<P>` | `Type '"documnt"' is not assignable to type '"project" \| "document"'` |
+| `enforcer.check({ resource: 'document', action: 'rea' })` | `A extends InferActions<P, R>` | `Type '"rea"' is not assignable to type '"create" \| "read" \| ...'` |
+| `permissions.member.document = ['delet']` (typo) in `definePolicy` | template-literal validation in `ResourcePermissions` | `Type '"delet"' is not assignable to type '"create" \| "read" \| ...'` |
+| `roles.member.extends = ['admn']` | `extends?: readonly (keyof P['roles'])[]` | `Type '"admn"' is not assignable to type '"owner" \| "admin" \| ...'` |
+| Referencing missing condition `{ when: 'isOwnr' }` | `RuleDef<keyof P['conditions']>` | `Type '"isOwnr"' is not assignable to type '"isOwner" \| "sameTenant"'` |
+| `subject.roles = ['guest']` when `guest` not in policy | `Subject<InferRoles<P>>` | `Type '"guest"' is not assignable to type '"viewer" \| ...'` |
 
-| Mistake                                                          | Rejected at compile time? |
-|------------------------------------------------------------------|---------------------------|
-| `check({ resource: 'unknown', ... })`                            | ✅ never assignable to `InferResources` |
-| `check({ resource: 'post', action: 'foobar' })`                  | ✅ `InferActions<P,'post'>` excludes it |
-| `subject.roles = ['ghost']` for unknown role                     | ✅ `Subject<InferRoles<P>>` |
-| `definePolicy({ rules: [{ role: 'noone', ... }] })`              | ✅ `Rule<P>` constrains it |
-| `definePolicy({ rules: [{ resource: 'billing', action: 'publish' }]})` (action belongs to `post`) | ✅ distributive `RuleFor<P, R>` (§4.2) |
-| Forgetting `tenantId` on a subject under `strictTenant: true`    | ⚠ runtime — type is optional, runtime guard catches it |
-| Wildcard string typed as `'*'`                                   | ✅ literal-typed branch |
-| Returning `'allow'` from a condition (instead of `boolean`)      | ✅ `ConditionFn` return type |
-| `target.authorId` typed as `unknown` inside a `'post'` rule's condition | ✅ `TInstances['post']` narrowed (§4.3) |
-| `fields: []` at `definePolicy()` time                            | ✅ `[string, ...string[]]` non-empty tuple |
+### 4.4 Conditional & template-literal magic — only where it earns its keep
 
-The library ships **no string-typed escape hatches** — every public
-parameter is constrained by inferred types from the policy literal. The
-only runtime-only check is the tenant requirement, which is opt-out via
-`strictTenant: false` rather than a type-system constraint, so that
-single-tenant apps can omit it cleanly.
+We **deliberately avoid** clever type-level computation when it does not add a
+real DX win:
+
+- ❌ No "compile-time policy compilation" returning a giant mapped type — its
+  cost in IDE responsiveness on real-world policies (>40 actions × >20
+  resources) outweighs the benefit.
+- ❌ No `Result`-typed `check()` with discriminated unions for the happy path —
+  noisy at every call site.
+- ✅ We do narrow `data` to a per-resource shape via an optional augmentation
+  module declared by users in their app:
+
+```ts
+// in user code (optional)
+declare module '@authkit/permissions' {
+  interface ResourceDataMap {
+    document: { id: string; ownerId: string; tenantId: string };
+    project:  { id: string; tenantId: string };
+  }
+}
+```
+
+…which makes `data` strongly typed inside conditions:
+
+```ts
+conditions: {
+  isOwner: ({ subject, resource, resourceType }) => {
+    // resourceType is narrowed to 'document' | 'project'; resource has the
+    // matching shape from ResourceDataMap when passed.
+    return resource?.ownerId === subject.id;
+  },
+};
+```
 
 ---
 
 ## 5. Error Handling Strategy
 
-We use a **two-track strategy**:
-
-1. **`check()` returns a `Decision`** — never throws on a denied permission.
-2. **`enforce()` throws `PermissionError`** — for adapters/handlers that
-   want a `try`/`catch`-friendly failure path.
-
-This keeps audit and field-filtering paths free of `try`/`catch` while
-giving framework adapters a clean throw-and-map-to-403 ergonomic.
-
-### 5.1 Error hierarchy
+### 5.1 One error class, typed codes
 
 ```ts
-export type ErrorCode =
-  | 'PERMISSION_DENIED'
-  | 'TENANT_MISMATCH'
-  | 'CROSS_TENANT_DISALLOWED'
-  | 'INVALID_POLICY'
-  | 'EMPTY_FIELDS'
-  | 'CYCLE_DETECTED'
-  | 'UNKNOWN_ROLE'
-  | 'UNKNOWN_RESOURCE'
-  | 'UNKNOWN_ACTION'
-  | 'CONDITION_THREW'
-  | 'AUDIT_FAILED';
+// errors/codes.ts
+export const ERROR_CODES = {
+  INVALID_POLICY:        'INVALID_POLICY',        // thrown from definePolicy
+  ROLE_CYCLE:            'ROLE_CYCLE',
+  UNKNOWN_ROLE:          'UNKNOWN_ROLE',
+  UNKNOWN_RESOURCE:      'UNKNOWN_RESOURCE',
+  UNKNOWN_ACTION:        'UNKNOWN_ACTION',
+  UNKNOWN_CONDITION:     'UNKNOWN_CONDITION',
+  TENANT_REQUIRED:       'TENANT_REQUIRED',       // strictTenant violation
+  TENANT_MISMATCH:       'TENANT_MISMATCH',
+  CONDITION_THREW:       'CONDITION_THREW',
+  FORBIDDEN:             'FORBIDDEN',             // thrown by authorize()
+} as const;
 
-export abstract class AuthkitPermissionsError extends Error {
-  abstract readonly code: ErrorCode;
-  /** Stable, machine-readable. Always present. */
-  readonly name: string = this.constructor.name;
-}
+export type ErrorCode = typeof ERROR_CODES[keyof typeof ERROR_CODES];
+```
 
-export class PermissionError extends AuthkitPermissionsError {
-  readonly code: 'PERMISSION_DENIED' | 'TENANT_MISMATCH' | 'CROSS_TENANT_DISALLOWED';
-  readonly decision: Decision;
-  readonly subject: Subject;
-  readonly resource: string;
-  readonly action: string;
-  toResponse(): { status: 403; body: { error: string; code: ErrorCode } };
-}
+```ts
+// errors/base.ts
+export class PermissionError extends Error {
+  override readonly name = 'PermissionError';
+  readonly code: ErrorCode;
+  /** Structured context for audit logs / Sentry. Never contains PII by default. */
+  readonly context?: Readonly<Record<string, unknown>>;
+  /** Original error, when wrapping a thrown condition. */
+  override readonly cause?: unknown;
 
-export class PolicyError extends AuthkitPermissionsError {
-  readonly code:
-    | 'INVALID_POLICY'
-    | 'EMPTY_FIELDS'
-    | 'CYCLE_DETECTED'
-    | 'UNKNOWN_ROLE'
-    | 'UNKNOWN_RESOURCE'
-    | 'UNKNOWN_ACTION';
-  readonly path?: ReadonlyArray<string | number>; // JSON pointer-like
-}
-
-export class TenantMismatchError extends PermissionError {
-  readonly code: 'TENANT_MISMATCH' | 'CROSS_TENANT_DISALLOWED';
-}
-
-export class AuditError extends AuthkitPermissionsError {
-  readonly code: 'AUDIT_FAILED';
-  readonly cause: unknown;
+  constructor(
+    code: ErrorCode,
+    message: string,
+    context?: Record<string, unknown>,
+    cause?: unknown,
+  );
 }
 ```
 
-### 5.2 When to throw vs return
+### 5.2 When to throw vs return a boolean
 
-| Site                                          | Behaviour                                         |
-|-----------------------------------------------|---------------------------------------------------|
-| `definePolicy()` finds a cycle                | throw `PolicyError('CYCLE_DETECTED')`             |
-| `definePolicy()` references unknown role      | throw `PolicyError('UNKNOWN_ROLE')` (strict mode) |
-| `definePolicy()` rule with `fields: []`       | throw `PolicyError('EMPTY_FIELDS')`               |
-| `check()` finds no matching rule              | `Decision { allowed: false, reason: 'no_matching_rule' }` |
-| `check()` sees cross-tenant access            | `Decision { allowed: false, reason: 'tenant_mismatch' }` |
-| `check()` sees `crossTenant: true` without policy `allowCrossTenant: true` | `Decision { reason: 'cross_tenant_disallowed' }` |
-| `enforce()` and decision is `allowed: false`  | throw `PermissionError`                            |
-| Async condition rejects                       | `Decision { allowed: false, reason: 'condition_threw' }` + audit log |
-| Audit hook throws (mode `'log'`)              | swallowed, logged via `console.warn` once         |
-| Audit hook throws (mode `'throw'`)            | rethrown as `AuditError`                           |
-| Audit hook throws (mode `'deny'`)             | decision forced to `{ allowed: false, reason: 'condition_threw' }` |
-| User passes `subject.roles = []`              | `Decision { reason: 'subject_has_no_roles' }`     |
+| Surface | Behaviour | Rationale |
+|---|---|---|
+| `definePolicy` | **throws** on invalid input | Configuration errors must crash fast at boot |
+| `enforcer.check` / `checkAsync` | **returns** `boolean` (or Promise of) on allow/deny | Hot path; caller decides what to do |
+| `enforcer.authorize` | **throws** `PermissionError(FORBIDDEN)` on deny | Convenience for HTTP/RPC handlers |
+| `enforcer.explain` | **never throws** (except for ROLE_CYCLE / UNKNOWN_*) | Designed for tests/audit |
+| Condition function throws | enforcer wraps and re-throws as `CONDITION_THREW`, audit emits `denied` for this attempt with the original cause | Prevents privilege escalation through buggy conditions |
+| `strictTenant: true` + missing `tenantId` | **throws** `TENANT_REQUIRED` from `check` | Tenant-leakage is a security incident, not a deny |
 
-**Why this split:** authorization decisions are part of normal control
-flow. Throwing on a denied decision pushes every call site into a
-`try`/`catch` for non-exceptional control flow, which encourages bugs
-(swallowed `catch (e) {}`, missing audit). `Decision` keeps the
-information-rich verdict; `enforce()` is an opt-in shortcut.
+There is **no `Result<T, E>` discriminated union** in the public API. The
+report flagged "5-minute getting started" as a key DX promise — `Result` types
+double the call-site noise for negligible safety gain in this domain. Errors
+that *can* be ignored are `boolean`; errors that *must* be handled at boot
+are thrown.
+
+### 5.3 Audit emission on errors
+
+A condition that throws produces an audit event:
+
+```ts
+{
+  ts: 1745000000000,
+  decision: 'deny',
+  reason: 'CONDITION_THREW',
+  conditionName: 'isOwner',
+  cause: 'TypeError: Cannot read properties of undefined',
+  subject: { id: 'u_1', roles: ['member'], tenantId: 't_1' },
+  action: 'update',
+  resource: 'document',
+  data: { id: 'd_42' },
+}
+```
+
+The original error then propagates so application monitoring can flag it
+loudly — we never silently turn a buggy condition into a permanent deny
+without telling someone.
 
 ---
 
 ## 6. Bundle & Tree-shaking Plan
 
+Target from the report: `min_bundle_size_kb: 2.8`, `target_bundle_size_kb: 5`.
+
 ### 6.1 Entry points (subpath exports)
 
-| Entry                                       | Target gzip | Purpose                                                      |
-|---------------------------------------------|-------------|--------------------------------------------------------------|
-| `@authkit/permissions`                      | < 5 KB      | Core (definePolicy + checks + serialize + accessibleBy AST)  |
-| `@authkit/permissions/builder`              | < 0.8 KB    | Imperative `AbilityBuilder` (advanced/dynamic, opt-in)       |
-| `@authkit/permissions/audit`                | < 0.5 KB    | `consoleAudit`, `noopAudit`                                  |
-| `@authkit/permissions/errors`               | < 0.4 KB    | Error classes only                                           |
-| `@authkit/permissions/types`                | 0 KB (types)| Type-only re-exports                                         |
-| `@authkit/permissions/orm/prisma`           | < 0.6 KB    | `toPrisma(filterAst)` adapter                                |
-| `@authkit/permissions/orm/drizzle`          | < 0.6 KB    | `toDrizzle(filterAst, table)` adapter                        |
-| `@authkit/permissions/orm/mongoose`         | < 0.6 KB    | `toMongo(filterAst)` adapter                                 |
-| `@authkit/permissions/adapters/next`        | < 1 KB      | Next.js App Router adapter (`nextPermissions` + `protectRoute`) |
-| `@authkit/permissions/adapters/hono`        | < 0.6 KB    | Hono middleware (`honoPermissions`)                          |
-| `@authkit/permissions/adapters/express`     | < 0.6 KB    | Express middleware (`expressPermissions`)                    |
-| `@authkit/permissions/adapters/fastify`     | < 0.7 KB    | Fastify plugin (`fastifyPermissions`)                        |
-| `@authkit/permissions/adapters/nestjs`      | < 1.5 KB    | Guard + decorators                                           |
-| `@authkit/permissions/adapters/trpc`        | < 0.6 KB    | tRPC procedure factory (`trpcPermissions`)                   |
-| `@authkit/permissions/react`                | < 1.2 KB    | `<Can/>`, `useCan`, Provider                                 |
-| `@authkit/permissions/vue`                  | < 1.0 KB    | `useCan` composable + plugin                                 |
+| Subpath | Purpose | Size budget (gzipped, minified) |
+|---|---|---|
+| `.` (root) | core: `definePolicy`, `createEnforcer`, types, `PermissionError` | **5 KB** |
+| `./errors` | error class + codes constant only | 0.4 KB |
+| `./audit` | `composeAudit`, default JSON formatter, timing wrapper | 0.5 KB |
+| `./builder` | optional fluent DSL builder | 0.8 KB |
+| `./types` | type-only (zero runtime) | 0 KB |
+| `./adapters/next` | App Router wrappers + middleware | 1 KB |
+| `./adapters/hono` | middleware factory | 0.6 KB |
+| `./adapters/express` | middleware factory | 0.6 KB |
+| `./adapters/fastify` | plugin factory | 0.7 KB |
+| `./adapters/nestjs` | guard + decorator + module | 1.5 KB |
+| `./adapters/trpc` | middleware factory | 0.6 KB |
+| `./orm/prisma` | role/membership loader | 0.6 KB |
+| `./orm/drizzle` | role/membership loader | 0.6 KB |
+| `./orm/mongoose` | role/membership loader | 0.6 KB |
+| `./react` | provider + hook + component | 1.2 KB |
+| `./vue` | plugin + composable + component | 1 KB |
 
-### 6.2 Tactics
+`size-limit` runs in CI with these budgets — a regression fails the PR.
 
-- `"sideEffects": false` in `package.json` so bundlers can drop unused exports.
-- One-export-per-file inside `core/`; the public barrel re-exports only
-  what's documented. No object spreads in barrels (kills tree-shaking).
-- `serialize()` and `accessibleBy()` are **free functions**, not methods,
-  so they tree-shake when unused (per the reviewer note: SOC2 export and
-  ORM filtering are not hot paths).
-- The imperative `AbilityBuilder` lives behind a separate subpath
-  (`/builder`) so the 95 % of callers using `definePolicy()` literals do
-  not pay for its method-chained mutable state.
-- No `class` field initializers that touch external modules at top level.
-- **Edge-safe runtime feature detection**. All `process.env`, `globalThis.process`,
-  `Deno`, `Bun` reads go through `utils/env.ts`:
-  ```ts
-  // src/utils/env.ts
-  export const isProduction = (): boolean =>
-    typeof process !== 'undefined' && process?.env?.NODE_ENV === 'production';
-  export const isDev = (): boolean => !isProduction();
-  ```
-  Optional chaining alone (`process?.env?.X`) does **not** protect against
-  `process` being undeclared in Cloudflare Workers / Deno — it would
-  throw `ReferenceError`. `typeof process !== 'undefined'` is the only
-  portable check. A Biome rule (`no-restricted-syntax` for `MemberExpression[object.name='process']`
-  outside `src/utils/env.ts`) enforces this; CI fails on violation. The
-  edge-runtime smoke test in §9.7 #38 also exercises the dev-mode
-  warning code paths to catch any sneak-through.
-- Adapters live behind subpath exports; `import { definePolicy }` from
-  the root never pulls in `react`, `next`, `nestjs`, ORM filters, or the builder.
-- Errors are tiny classes, not symbols — emoji-free `name`/`message`.
-- Build with `tsup` → ESM-only (CJS shims only for `errors/` and root,
-  for legacy Node tooling).
-- `size-limit` checks every entry in CI on every PR.
+### 6.2 Tree-shaking guarantees
 
-### 6.3 Conditional exports map (target shape — see `package.json`)
+- `package.json` has `"sideEffects": false` — proven free of side-effects by
+  static analysis (no top-level expression with a side-effect; freezing is
+  scoped inside factory functions).
+- Each subpath has its own ESM file in `dist/<sub>/index.js` — no barrel
+  re-exports the user did not explicitly import.
+- We never `import './polyfill'` or auto-register globals.
+- Constants like `ERROR_CODES` are exported via `export const ERROR_CODES =
+  Object.freeze({ ... })` — bundlers fold dead branches when only one code
+  is referenced.
 
-```jsonc
-{
-  ".": {
-    "types":  "./dist/index.d.ts",
-    "import": "./dist/index.js",
-    "require":"./dist/index.cjs"
-  },
-  "./adapters/next":    { "types": "./dist/adapters/next/index.d.ts",    "import": "./dist/adapters/next/index.js" },
-  "./adapters/hono":    { "types": "./dist/adapters/hono/index.d.ts",    "import": "./dist/adapters/hono/index.js" },
-  "./adapters/express": { "types": "./dist/adapters/express/index.d.ts", "import": "./dist/adapters/express/index.js" },
-  "./adapters/fastify": { "types": "./dist/adapters/fastify/index.d.ts", "import": "./dist/adapters/fastify/index.js" },
-  "./adapters/nestjs":  { "types": "./dist/adapters/nestjs/index.d.ts",  "import": "./dist/adapters/nestjs/index.js" },
-  "./adapters/trpc":    { "types": "./dist/adapters/trpc/index.d.ts",    "import": "./dist/adapters/trpc/index.js" },
-  "./builder":          { "types": "./dist/builder/index.d.ts",          "import": "./dist/builder/index.js" },
-  "./orm/prisma":       { "types": "./dist/orm/prisma/index.d.ts",       "import": "./dist/orm/prisma/index.js" },
-  "./orm/drizzle":      { "types": "./dist/orm/drizzle/index.d.ts",      "import": "./dist/orm/drizzle/index.js" },
-  "./orm/mongoose":     { "types": "./dist/orm/mongoose/index.d.ts",     "import": "./dist/orm/mongoose/index.js" },
-  "./react":            { "types": "./dist/react/index.d.ts",            "import": "./dist/react/index.js" },
-  "./vue":              { "types": "./dist/vue/index.d.ts",              "import": "./dist/vue/index.js" },
-  "./audit":            { "types": "./dist/audit/index.d.ts",            "import": "./dist/audit/index.js" },
-  "./errors":           { "types": "./dist/errors/index.d.ts",           "import": "./dist/errors/index.js", "require": "./dist/errors/index.cjs" },
-  "./types":            { "types": "./dist/types/index.d.ts" },
-  "./package.json":     "./package.json"
-}
-```
+### 6.3 Build pipeline
+
+`tsup` with the following config (rationale in §8):
+
+- `format: ['esm', 'cjs']` — ESM for modern runtimes (and required by
+  Workers/Edge), CJS only for the root entry to support older Node
+  consumers; framework adapters are ESM-only because every supported
+  framework version is ESM-compatible.
+- `dts: true` — emits `.d.ts` next to JS, walks subpath entries.
+- `treeshake: 'recommended'` — Rollup-flavoured shaking on top of esbuild.
+- `splitting: false` — avoids hash-named common chunks that complicate
+  subpath exports and break `require()` resolution.
+- `target: 'es2022'` — supported by Node 18, all browsers in our matrix,
+  Workers and Edge.
+
+### 6.4 Verification in CI
+
+- `size-limit` against the budgets above.
+- `@arethetypeswrong/cli` (`attw --pack`) — guarantees correct ESM/CJS dual
+  package and accurate `types` resolution per subpath.
+- `publint` — catches malformed `exports` / `files` fields before publish.
 
 ---
 
 ## 7. Dependencies
 
-### 7.1 Runtime dependencies — **none**
+### 7.1 Runtime — zero
 
-The headline differentiator is zero deps. Every algorithmic primitive
-we need (Set, Map, WeakMap, Object.freeze, Promise) is part of ES2020.
+The market analysis ranks "zero deps" as a top differentiator against CASL
+(several deps) and Casbin (~20). We commit to **zero** runtime `dependencies`.
 
-| Reason a dep was rejected                                           | Replacement                                  |
-|---------------------------------------------------------------------|----------------------------------------------|
-| `lodash.merge`, `dequal`                                            | We don't merge user input deeply             |
-| `mitt`, `nanoevents`                                                | Audit hook is a single function, not pub/sub |
-| `zod`/`valibot` for policy shape                                    | We validate by hand — runtime cost <1ms; ship size <100B |
-| `dataloader` for async conditions                                   | We expose a `cache?:` option on conditions; user wires their loader |
-| `tslib` runtime helpers                                             | `tsconfig` `target: ES2020`, `importHelpers: false` |
+Specifically we **do not** depend on:
 
-### 7.2 Peer dependencies (all `optional`)
+- `lodash` / `lodash-es` — the few helpers we need (≤ 30 LOC) are vendored
+  into `src/utils/`.
+- `tslib` / `@swc/helpers` — `target: 'es2022'` lets the TS compiler emit
+  native `class`, `?.`, `??=` etc. without runtime helpers.
+- `zod` / `valibot` for policy validation — the policy is validated by a
+  tiny hand-written validator (≈80 LOC, dev-only branch elided in prod
+  builds). Adding zod would multiply the bundle 6×.
 
-| Peer            | Version           | Used by                                  |
-|-----------------|-------------------|------------------------------------------|
-| `next`          | `>=13.4 <16`      | `adapters/next`                          |
-| `hono`          | `>=4 <5`          | `adapters/hono`                          |
-| `express`       | `>=4 <6`          | `adapters/express`                       |
-| `fastify`       | `>=4 <6`          | `adapters/fastify`                       |
-| `@nestjs/common`| `>=10 <12`        | `adapters/nestjs`                        |
-| `@trpc/server`  | `>=11 <13`        | `adapters/trpc`                          |
-| `react`         | `>=18 <20`        | `react`                                  |
-| `vue`           | `>=3.4 <4`        | `vue`                                    |
-| `@prisma/client`| `>=5 <7`          | `orm/prisma`                             |
-| `drizzle-orm`   | `>=0.30 <1`       | `orm/drizzle`                            |
-| `mongoose`      | `>=7 <9`          | `orm/mongoose`                           |
+### 7.2 Peer dependencies — opt-in per adapter
 
-All peers are marked `peerDependenciesMeta: { ..: { optional: true } }`
-so installing the core never drags 11 frameworks in.
+```
+react       >=18 <20    optional
+vue         >=3.4 <4    optional
+next        >=13.4 <16  optional
+hono        >=4 <5      optional
+express     >=4 <6      optional
+fastify     >=4 <6      optional
+@nestjs/common >=10 <12 optional
+@trpc/server   >=11 <13 optional
+@prisma/client >=5 <7   optional
+drizzle-orm    >=0.30 <1 optional
+mongoose       >=7 <9   optional
+```
 
-### 7.3 Dev dependencies (locked in `package.json`)
+All marked `optional` in `peerDependenciesMeta` — installing the core does
+not force install of any framework. The version ranges are pinned via the
+**range pattern** `>=X.Y <Z` (open upper bound at the next major) so we
+don't have to chase patch releases.
 
-`typescript`, `tsup`, `vitest`, `@vitest/coverage-v8`, `@biomejs/biome`,
-`size-limit`, `@size-limit/preset-small-lib`, `@types/node`,
-`@types/react`, `react`, `react-dom`, `@testing-library/react`, `vue`,
-`@vue/test-utils`, `hono`, `express`, `fastify`, `next`,
-`@nestjs/common`, `@trpc/server`, `@prisma/client`, `drizzle-orm`,
-`mongoose`, `@cloudflare/vitest-pool-workers`, `@changesets/cli`,
-`publint`, `@arethetypeswrong/cli`.
+### 7.3 Dev dependencies — minimal but production-grade
 
-> Type tests are written as `*.test-d.ts` and run with `vitest run
-> --typecheck`. We **dropped `tsd`** — Vitest's built-in type-checking
-> covers the same ground, and shipping one runner is cheaper than two.
+Categories:
+
+- **Build & types**: `typescript`, `tsup`, `@arethetypeswrong/cli`, `publint`
+- **Test**: `vitest`, `@vitest/coverage-v8`, `@cloudflare/vitest-pool-workers`,
+  `@testing-library/react`, `@vue/test-utils`
+- **Lint/format**: `@biomejs/biome` — single tool replacing eslint+prettier;
+  10× faster CI lint step.
+- **Size**: `size-limit` + `@size-limit/preset-small-lib`
+- **Release**: `@changesets/cli`
+- **Framework dev-deps for testing adapters**: hono, express, fastify, next,
+  react, react-dom, vue, drizzle-orm, mongoose, @prisma/client,
+  @trpc/server, @nestjs/common, @types/express, @types/node,
+  @types/react, @types/react-dom
 
 ---
 
 ## 8. Configuration
 
-### 8.1 `tsconfig.json` (strict, editor-facing)
+### 8.1 `tsconfig.json`
 
 ```jsonc
 {
   "compilerOptions": {
-    "target": "ES2020",
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "lib": ["ES2020", "DOM"],
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
     "strict": true,
     "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
     "noImplicitOverride": true,
-    "noFallthroughCasesInSwitch": true,
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "verbatimModuleSyntax": true,
+    "noPropertyAccessFromIndexSignature": false,
+    "exactOptionalPropertyTypes": true,
+    "useUnknownInCatchVariables": true,
     "isolatedModules": true,
-    "esModuleInterop": false,
+    "verbatimModuleSyntax": true,
     "skipLibCheck": true,
-    "useDefineForClassFields": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-    "rootDir": "src",
-    "outDir": "dist",
+    "jsx": "react-jsx",
     "types": ["node"]
   },
-  "include": ["src", "tests"]
+  "include": ["src", "test"]
 }
 ```
 
-### 8.2 `tsconfig.build.json`
+`tsconfig.build.json` extends the above and excludes `test/` and JSX runtime.
 
-Extends the above; `"include": ["src"]`, `"declaration": true`,
-`"emitDeclarationOnly": true`. `tsup` handles the JS emit; we use `tsc`
-only for `.d.ts`.
+### 8.2 `vitest.config.ts` (sketch)
 
-### 8.3 `tsup.config.ts` (target shape)
+- Default `node` environment for `test/core/**`.
+- `jsdom` for `test/react/**`.
+- `@cloudflare/vitest-pool-workers` for `test/runtime/workers.test.ts`.
+- `typecheck.enabled = true`, `typecheck.include = ['test/**/*.test-d.ts']`.
+- Coverage thresholds: `lines 95`, `functions 95`, `branches 90` — security
+  library, no excuses.
 
-Multi-entry build, ESM by default, CJS only for `index` and `errors`:
+### 8.3 `package.json` highlights
+
+- `"name": "@authkit/permissions"`, `"version": "0.1.0"`, `"type": "module"`,
+  `"sideEffects": false`.
+- `"exports"` enumerates every subpath listed in §6.1 with both `import` and
+  (for the root + errors only) `require` resolutions.
+- `"engines": { "node": ">=18" }` — Node 18 is the lowest LTS still supported
+  in 2026.
+- Scripts: `build`, `dev`, `test`, `test:types`, `test:coverage`, `bench`,
+  `lint`, `format`, `size`, `publint`, `attw`, `release`,
+  `prepublishOnly` (chains `build → publint → attw → size`).
+- `size-limit` array enforces the §6.1 budgets.
+- `publishConfig.provenance: true` — npm provenance attestations.
+
+(See the actual `package.json` committed alongside this plan.)
+
+### 8.4 `.gitignore`
+
+Standard Node + TS + tooling. Pattern rules — no `./` prefix; trailing slash
+intentionally omitted so both files and directories with that name are
+matched.
+
+---
+
+## 9. Edge Cases
+
+### 9.1 Policy-level (caught at `definePolicy`)
+
+1. **Role cycle.** `a extends [b]`, `b extends [a]` → `ROLE_CYCLE` thrown at
+   policy compile time. DFS with grey/black colouring; error message names
+   the full cycle.
+2. **Self-extension.** `a extends [a]` → same as cycle.
+3. **Unknown role in `extends`.** `member extends ['superuser']` where
+   `superuser` is not a key of `roles` → `UNKNOWN_ROLE`.
+4. **Unknown resource in `permissions`.** `permissions.admin.documnt` →
+   `UNKNOWN_RESOURCE`.
+5. **Unknown action in resource permission.** `permissions.admin.document.delet`
+   → `UNKNOWN_ACTION`.
+6. **Unknown condition referenced from a rule.** `{ when: 'isOwnr' }` →
+   `UNKNOWN_CONDITION`.
+7. **Empty `actions` array on a resource.** Allowed but warned — typically a
+   work-in-progress; emits `audit` once on first `check` against the
+   resource (dev only).
+8. **Mixed array + object permission shape on the same resource.** Disallowed
+   by the type system; runtime validator double-checks.
+9. **Wildcard `*` listed alongside concrete actions.** Normalised to `*`
+   only — concrete entries become redundant but are allowed and stripped.
+10. **Deeply nested role inheritance (>32 levels).** Allowed but the LRU
+    capacity adjusts to ensure the closure is still computed in linear
+    time. We don't impose an arbitrary depth limit.
+11. **Frozen-input mutation.** `policy.spec.roles.admin = {}` throws in
+    strict mode, silently fails otherwise. We freeze recursively
+    (`deepFreeze`) on first construction.
+
+### 9.2 Subject / runtime check edge cases
+
+1. **No roles on subject** (`subject.roles = []`). Always denies; emits
+   audit with `reason: 'NO_ROLES'`.
+2. **Role on subject not declared in policy.** Denies, audit
+   `reason: 'UNKNOWN_ROLE_ON_SUBJECT'` — never throw, because production
+   subjects can survive policy-spec churn while a deploy is rolling.
+3. **`tenantId` missing in `strictTenant` mode.** Throws `TENANT_REQUIRED`.
+4. **`tenantId` mismatch** between `subject.tenantId` and `data.tenantId`.
+   Denies and audits `reason: 'TENANT_MISMATCH'` unless the subject has a
+   role with `crossTenant: true`. Audit always carries both tenant ids so
+   incident response can locate the leak.
+5. **Action called on resource with no rule for any of the subject's roles.**
+   Denies (default-deny). Audit `reason: 'NO_MATCHING_RULE'`.
+6. **Wildcard rule deny vs concrete-action allow conflict.** Default policy
+   semantics: **explicit deny wins**, then explicit allow, then wildcard
+   allow, then wildcard deny, then default deny. Documented prominently.
+7. **Async condition resolves after sync allow already returned.** Cannot
+   happen — the engine inspects whether any candidate condition is async
+   (`AsyncFunction` constructor or returns a thenable when invoked) and
+   promotes the entire rule's evaluation to async; it cannot return
+   synchronously if any candidate is async. Tested with both `async function`
+   and `() => Promise<...>` shapes.
+8. **Condition throws synchronously.** Caught, wrapped as
+   `CONDITION_THREW`, decision is `deny`, audit emits with `cause`, and
+   the wrapped error is re-thrown to the caller of `check`.
+9. **Condition returns a non-boolean.** Coerced via `Boolean(...)` and
+   audit emits a dev-only warning. We never silently accept truthy strings
+   as allows in production.
+10. **Resource `data` undefined when condition expects it.** Each condition
+    is documented to handle `data === undefined`. The default conditions
+    (`sameTenant`, `isOwner`) deny when data is missing.
+11. **Multiple roles producing conflicting decisions.** Resolved via the
+    same allow/deny precedence as wildcard conflicts.
+12. **Effective-permissions cache key collision** (theoretical). We hash
+    sorted role tuple via FNV-1a over the joined string; collision
+    probability for typical policies (<128 roles) is <2⁻³⁰.
+13. **Race condition under high concurrency on the same Enforcer
+    instance.** All caches are read-only after first compute; concurrent
+    writes are idempotent (same input produces same compiled output) so
+    we don't need locks. Verified with `vitest --concurrency`.
+
+### 9.3 Runtime-portability edge cases
+
+1. **Cloudflare Workers / Vercel Edge — no `process.env`.** We never
+   reference `process` directly; behaviour flags are passed via factory
+   options.
+2. **Workers — no `Buffer`.** No reliance on Buffer; hashing uses simple
+   string ops.
+3. **Workers — no FS.** No FS access at runtime (all data lives in the
+   policy object).
+4. **Bun / Deno** — verified via cross-runtime CI (subset of tests pinned
+   to each).
+5. **React Server Components.** `react` adapter exports a server-safe
+   `useCanServer` that never reaches for the React context; tested with
+   `next` `15+` App Router. The `<PermissionProvider>` is `'use client'`.
+6. **Tree-shaking on bundlers without ESM-aware tree-shake (Webpack 4).**
+   Documented as unsupported — the report's `runtime_targets` start at
+   modern ES2020+ runtimes; Webpack 4 is out of scope.
+
+### 9.4 Audit & observability edge cases
+
+1. **Audit hook throws.** Caught and re-thrown only if `options.strictAudit`
+   is `true`. By default we log to `console.error` (Edge-safe) and continue
+   — the request must not be denied because Datadog is down.
+2. **Audit hook is async.** Awaited only by `checkAsync` / `authorize`; the
+   sync `check` fast-path schedules the hook via `queueMicrotask` to avoid
+   making every check a Promise.
+3. **High-cardinality tenant id leaking into metrics.** Default formatter
+   strips `tenantId` to a `tenantHash` (8-char FNV) when the formatter
+   detects integration with `console`. Opt-out via `audit/formatter`.
+
+### 9.5 Policy migration & version skew
+
+1. **Policy version field.** `definePolicy` accepts `version: string` —
+   audit events include it, allowing post-incident attribution.
+2. **Removed action while subjects still reference it.** A subject role
+   referencing a removed action simply has no rule — denies cleanly. No
+   crash.
+3. **Renamed role.** Subjects with the old role get `UNKNOWN_ROLE_ON_SUBJECT`
+   denies until they re-authenticate. Migration recipe documented in
+   README (dual-role grace period).
+
+---
+
+## Appendix A — Worked example (end-to-end DX)
 
 ```ts
-export default defineConfig([
-  { entry: ['src/index.ts'],                  format: ['esm', 'cjs'], dts: true, treeshake: true, splitting: false },
-  { entry: ['src/audit/index.ts'],            format: ['esm'],         dts: true, treeshake: true },
-  { entry: ['src/errors/index.ts'],           format: ['esm', 'cjs'],  dts: true, treeshake: true },
-  { entry: ['src/types/index.ts'],            format: ['esm'],         dts: true },
-  { entry: ['src/builder/index.ts'],          format: ['esm'],         dts: true, treeshake: true },
-  { entry: ['src/orm/prisma/index.ts'],       format: ['esm'],         dts: true, external: ['@prisma/client'] },
-  { entry: ['src/orm/drizzle/index.ts'],      format: ['esm'],         dts: true, external: ['drizzle-orm'] },
-  { entry: ['src/orm/mongoose/index.ts'],     format: ['esm'],         dts: true, external: ['mongoose'] },
-  { entry: ['src/adapters/next/index.ts'],    format: ['esm'],         dts: true, external: ['next'] },
-  { entry: ['src/adapters/hono/index.ts'],    format: ['esm'],         dts: true, external: ['hono'] },
-  { entry: ['src/adapters/express/index.ts'], format: ['esm'],         dts: true, external: ['express'] },
-  { entry: ['src/adapters/fastify/index.ts'], format: ['esm'],         dts: true, external: ['fastify'] },
-  { entry: ['src/adapters/nestjs/index.ts'],  format: ['esm'],         dts: true, external: ['@nestjs/common'] },
-  { entry: ['src/adapters/trpc/index.ts'],    format: ['esm'],         dts: true, external: ['@trpc/server'] },
-  { entry: ['src/react/index.ts'],            format: ['esm'],         dts: true, external: ['react'] },
-  { entry: ['src/vue/index.ts'],              format: ['esm'],         dts: true, external: ['vue'] },
-]);
+// policy.ts
+import { definePolicy } from '@authkit/permissions';
+
+export const policy = definePolicy({
+  version: '2026-04-28',
+  roles: {
+    owner:  { extends: ['admin'] },
+    admin:  { extends: ['member'] },
+    member: { extends: ['viewer'] },
+    viewer: {},
+    superadmin: { extends: [], crossTenant: true },
+  },
+  resources: {
+    project:  { actions: ['create', 'read', 'update', 'delete', 'invite'] },
+    document: { actions: ['create', 'read', 'update', 'delete', 'comment'] },
+  },
+  conditions: {
+    isOwner:    ({ subject, resource }) => resource?.ownerId === subject.id,
+    sameTenant: ({ subject, resource }) => resource?.tenantId === subject.tenantId,
+  },
+  permissions: {
+    viewer: {
+      project:  ['read'],
+      document: ['read', 'comment'],
+    },
+    member: {
+      document: {
+        create: { when: 'sameTenant' },
+        update: { when: ['isOwner', 'sameTenant'] },
+      },
+    },
+    admin: {
+      project:  ['create', 'update', 'invite'],
+      document: ['delete'],
+    },
+    owner: {
+      project:  ['*'],
+      document: ['*'],
+    },
+    superadmin: {
+      project:  ['*'],
+      document: ['*'],
+    },
+  },
+});
+
+// enforcer.ts
+import { createEnforcer } from '@authkit/permissions';
+import { policy } from './policy';
+export const enforcer = createEnforcer(policy, {
+  audit: (event) => logger.info({ msg: 'authz', ...event }),
+});
+
+// any handler
+import { enforcer } from './enforcer';
+
+await enforcer.authorize({
+  subject: { id: user.id, roles: user.roles, tenantId: user.tenantId },
+  action: 'update',
+  resource: 'document',
+  data: doc,
+});
+// — throws PermissionError(FORBIDDEN) on deny; otherwise returns void.
 ```
 
-### 8.4 `vitest.config.ts`
-
-`environment: 'node'`, `typecheck.enabled: true`, `coverage.thresholds`
-set to `lines: 95`, `branches: 95`, `functions: 100`. Workspaces split
-the suite so React/Vue/Edge-runtime tests run in their own
-environments.
-
-### 8.5 `package.json` fields
-
-The companion `package.json` (see repo root) sets:
-
-- `"name": "@authkit/permissions"`
-- `"version": "0.1.0"`
-- `"type": "module"`
-- `"sideEffects": false`
-- `"exports": { ... full subpath map including /builder, /orm/* ... }`
-- `"files": ["dist", "README.md", "LICENSE"]`
-- `"engines": { "node": ">=18" }`
-- `"keywords"`: from the report's SEO list
-- `"peerDependencies"` and `"peerDependenciesMeta"` per §7.2
-- Scripts: `build`, `dev`, `test`, `test:types`, `bench`, `lint`,
-  `format`, `size`, `release`, `prepublishOnly`.
-
----
-
-## 9. Edge Cases (must be covered by tests)
-
-### 9.1 Policy construction
-
-1. **Cyclic role inheritance** — `A extends B`, `B extends A` →
-   `PolicyError('CYCLE_DETECTED')` at `definePolicy()`.
-2. **Diamond inheritance** — `owner extends [admin, manager]`, both
-   extend `member`; `member`'s permissions counted once, not twice.
-3. **Self-inheritance** — `admin extends ['admin']` → `CYCLE_DETECTED`.
-4. **Unknown role/resource/action in a rule** — strict mode throws,
-   non-strict warns once via `console.warn`.
-5. **Empty `roles`/`resources`/`rules`** — accepted; every check
-   returns `{ allowed: false, reason: 'no_matching_rule' }`.
-6. **Duplicate role/resource keys** — TS literal-type semantics already
-   prevent this; runtime double-checks in case of dynamic builder.
-7. **Reserved literal `'*'` used as a role/resource/action name** —
-   rejected with `INVALID_POLICY`.
-8. **Mutating the input policy after `definePolicy()`** — silently
-   ignored (deep frozen).
-9. **`fields: []` (empty array)** — rejected with
-   `PolicyError('EMPTY_FIELDS')` at construction time. The empty array
-   is ambiguous ("all" vs "none") and was a silent-permit footgun in
-   the prior design.
-10. **Action declared on a different resource** — e.g.
-    `{ resource: 'billing', action: 'publish' }` where `'publish'` is
-    declared on `'post'` — caught at compile time by distributive
-    `RuleFor<P, R>` (§4.2). Runtime double-checks in builder mode.
-
-### 9.2 Subject
-
-11. **`tenantId` empty string under `strictTenant: true`** — denied with
-    `tenant_mismatch`.
-12. **`tenantId` omitted under `strictTenant: false`** — accepted; tenant
-    guard is bypassed entirely. Conditions still run.
-13. **`subject.crossTenant === true` with `allowCrossTenant: false`
-    (default)** — denied with `cross_tenant_disallowed`. The flag has
-    no effect without the policy-level opt-in.
-14. **`subject.crossTenant === true` with `allowCrossTenant: true`** —
-    tenant guard bypassed; every audit event flagged with `crossTenant: true`
-    plus the granting policy id.
-15. **`subject.roles = []`** — every check returns
-    `{ allowed: false, reason: 'subject_has_no_roles' }` (does not throw).
-16. **Role unknown to the policy in `subject.roles`** — silently dropped
-    in resolution (logged via `console.warn` once per role per process).
-17. **Same role listed twice in `subject.roles`** — deduped.
-
-### 9.3 Rule semantics
-
-18. **Wildcard action `'*'` in a rule** — matches every action declared
-    on that resource (not actions on other resources).
-19. **Wildcard resource `'*'`** — matches every resource for that role.
-20. **Both rule arrays AND wildcards** — `action: ['read', '*']` →
-    `INVALID_POLICY` (mixing is ambiguous).
-21. **Allow + deny on same `(role, resource, action)`** — deny wins
-    when `precedence: 'deny'` (default).
-22. **Rule ordering & priority** — within a `(role, resource, action)`
-    tuple, the evaluator sorts by `priority` descending, ties broken by
-    insertion order (later rule overrides earlier within the same
-    bucket). This is documented as part of the §4.2 contract so a
-    refactor that re-orders rules cannot silently change behaviour.
-23. **Allow with `condition` returning `false`** — falls through to next
-    matching rule (by priority then insertion order), then to
-    `no_matching_rule` if none allow.
-24. **Allow + deny, deny has condition that returns `false`** — allow
-    wins (deny didn't actually trigger).
-25. **`fields` always non-empty** — empty arrays were rejected at
-    construction (#9). `Decision.fields` is therefore either
-    `undefined` or non-empty.
-
-### 9.4 Conditions
-
-26. **Sync condition called from `check()`** — runs inline.
-27. **Async condition called from `check()` (sync)** — returned
-    decision is `{ allowed: false, reason: 'condition_failed' }` plus a
-    `console.warn` (because we cannot await). Use `checkAsync()`.
-28. **Condition returns a non-boolean** — coerced via `Boolean()`; in
-    dev mode (`utils/env.isDev()`, which uses
-    `typeof process !== 'undefined' && process.env?.NODE_ENV !== 'production'`)
-    logged as a correctness warning. The `typeof` guard is mandatory —
-    plain optional chaining would `ReferenceError` on Cloudflare
-    Workers / Deno where `process` is undeclared.
-29. **Condition throws synchronously** — `Decision { reason:
-    'condition_threw' }`; original error attached via `cause`.
-30. **Async condition rejects** — same as above; the rejection is
-    logged (audit) but never bubbles up.
-31. **`target` undefined when condition expects it** — condition
-    receives `target: undefined`; condition is responsible for
-    handling. We do NOT skip the condition (would be a footgun).
-32. **`target` typed via `TInstances`** — when a consumer supplies
-    `TInstances`, the condition receives `target?: TInstances[R]`, not
-    the catch-all `ResourceInstance` (§4.3).
-
-### 9.5 Tenant scoping
-
-33. **`subject.tenantId === 't1'`, `target.tenantId === 't2'`** →
-    `tenant_mismatch` (under `strictTenant: true`).
-34. **`target.tenantId` undefined** → tenant guard skipped (resource is
-    not tenant-scoped). Conditions still run.
-35. **`subject.crossTenant === true` and `allowCrossTenant: true`** —
-    guard always passes; audit event flagged with `crossTenant: true`
-    (replaces the prior `'*'` sentinel — see §2.4).
-
-### 9.6 Audit
-
-36. **Audit hook returns a Promise** — `check()` does NOT await it
-    (fire-and-forget); `checkAsync()` awaits for backpressure.
-37. **Audit hook throws / rejects** — behaviour depends on
-    `auditFailureMode`:
-    - `'log'` (default): swallow + `console.warn` once; decision unchanged.
-    - `'throw'`: rethrow as `AuditError` (the caller — typically a
-      framework adapter — converts to 5xx).
-    - `'deny'`: force decision to `{ allowed: false, reason: 'condition_threw' }`.
-      For SOC2 shops where a broken audit pipeline must fail closed.
-38. **`withAudit()` chained twice** — only the latest hook runs (latest
-    wins, documented).
-
-### 9.7 Adapters
-
-39. **Next.js — request without subject** — adapter returns 401
-    (not a permission error; `getSubject()` is the auth concern).
-40. **tRPC — input refining the resource shape** — adapter exposes
-    `target` from the parsed input, not the raw request.
-41. **NestJS guard executed before the auth guard** — guard fails
-    closed (subject undefined → 401), guidance in docs to register
-    auth guard first.
-42. **React `<Can>` used outside `<PermissionsProvider>`** — render
-    `null` and emit a single `console.error` in dev.
-43. **SSR — `useCan()` on the server** — works (no DOM access);
-    Provider supplies the same `permissions` instance.
-44. **Edge runtime — no `process` global at all** — only `utils/env.ts`
-    accesses `process`, and it uses
-    `typeof process !== 'undefined'`. The smoke test runs the core in
-    `@cloudflare/vitest-pool-workers` and explicitly exercises the
-    dev-mode warning paths so any sneak-through fails CI.
-
-### 9.8 ORM filters
-
-45. **Subject-only condition** (e.g. `target.authorId === subject.id`) —
-    `accessibleBy()` compiles via the declarative condition shape into
-    `{ kind: 'eq', field: 'authorId', value: subject.id }`.
-46. **Opaque condition** (arbitrary user function not using the
-    declarative helpers) — `accessibleBy()` returns `{ kind: 'all' }`
-    plus `Decision.warning: 'opaque_condition'` so callers know they
-    must post-filter row-by-row. Documented as the trade-off; no silent
-    privilege grant.
-47. **Empty intersection** (deny-overrides + no allow rule) →
-    `{ kind: 'none' }`; adapters translate to a falsy SQL predicate /
-    `_id: { $in: [] }` so the DB returns zero rows without a round trip.
-48. **`crossTenant: true`** → tenant `eq` clause omitted; query returns
-    every tenant's rows. Audit event records the cross-tenant access.
-
-### 9.9 Performance / DoS surface
-
-49. **Policy with 10 000 rules** — index lookup is O(1); construction
-    is O(N). Benchmark target: `< 5 ms` to construct, `< 20 µs` per check.
-50. **Subject with 100 roles** — role-graph expansion deduped by `Set`.
-51. **Adversarial role graph (deep chain `r0 → r1 → … → r999`)** —
-    DFS with memoization caps at O(N) once.
-52. **Audit hook that hangs (never resolves)** — `check()` does not
-    await; `checkAsync()` is documented to honour user-side timeouts.
-
----
-
-## 10. Documentation Plan
-
-`docs/` will be built into a small Astro site; pages mirror the report's
-talking points so search queries (`"casbin alternative lightweight"`,
-`"rbac for next.js app router"`, `"row level authorization typescript"`)
-land on dedicated pages. The plan only records the structure here —
-content writing is part of implementation. The `orm-filters.md` page
-calls out `accessibleBy()` explicitly because that is the single
-biggest CASL parity feature and the row-level enforcement story SOC2
-auditors expect.
-
----
-
-## 11. Out of Scope (matches report)
-
-- Authentication (delegated to a future `@authkit/session`).
-- Persistence of roles/users — we ship interfaces, not a store.
-  ORM filtering via `accessibleBy()` is **in scope** (the AST and the
-  thin `prisma`/`drizzle`/`mongoose` translators), but the storage
-  layer for roles/memberships remains the consumer's responsibility.
-- ReBAC / Zanzibar relationship graphs (use OpenFGA for that).
-- Policy-as-code DSLs (Rego/Polar) — TypeScript IS the DSL.
-- A UI for editing policies (commercial niche).
-
----
-
-## Review Changes
-
-Log of adjustments made in response to the architecture review by
-Mykhailo Kryvytskyi (PR #1). Each row references the original concern,
-the resolution, and the sections of this document that were edited.
-
-| # | Reviewer concern | Resolution | Sections touched |
-|---|------------------|------------|------------------|
-| 1 | **[high — security]** `tenantId === '*'` sentinel for super-admin is a privilege-escalation footgun: a leaked user-controlled string evaporates every tenant boundary. | **Agreed.** Removed the `'*'` sentinel entirely. Cross-tenant access now requires both `PolicyOptions.allowCrossTenant: true` (policy-level opt-in, default `false`) AND `subject.crossTenant === true` (subject-level boolean — not a string, code-reviewable, can't be assigned by accident from a path param). New `cross_tenant_disallowed` decision reason and `CROSS_TENANT_DISALLOWED` error code surface the disallowed case explicitly instead of silently treating it as `tenant_mismatch`. | §2.4 (rewritten); §2.5 (new reason); §4.2 `PolicyOptions.allowCrossTenant`; §5.1 new error code; §9.2 #13–#14, §9.5 #35; §11 (no change). |
-| 2 | **[high — DX/API]** `Permissions.check` takes an object, `ScopedAbility.can` takes positional `(action, resource, ctx)`. Argument order trap (CASL vs. accesscontrol). | **Agreed.** Aligned both interfaces on the **same single-object call shape**. `Ability` now takes `{ resource, action, target?, context? }` everywhere — refactor-safe, lets us add fields (`reason`, `at`, `meta`) later. | §2.2 (unchanged shape); §2.3 (rewritten — was `ScopedAbility`, all positional signatures replaced with `AbilityCheckArgs`); §2.8 React `useCan` example updated to object arg. |
-| 3 | **[high — competitive]** No ORM/query-builder integration. `accessibleBy()` is CASL's #1 retention feature; without it we are permanently a tier behind on row-level filtering — also where SOC2 enforcement actually lives. | **Agreed.** Added `accessibleBy(ability, { resource, action? })` returning a normalized `AccessibleByFilter` AST in `src/core/accessible-by.ts`. New thin adapters under three new subpaths: `@authkit/permissions/orm/{prisma,drizzle,mongoose}` translating the AST to native `where`. Declarative condition helpers compile to `eq`/`in` clauses; opaque user-function conditions fall back to `{ kind: 'all' }` + a warning so the caller knows to post-filter. | §1 project structure (added `core/accessible-by.ts`, `src/orm/{prisma,drizzle,mongoose}/`); §2.9 (new); §3.1 module graph + dep rules; §6.1 + §6.3 entry points and exports map; §7.2 new optional peers (`@prisma/client`, `drizzle-orm`, `mongoose`); §7.3 dev deps; §8.3 tsup entries; §9.8 (new edge cases #45–#48); §11 wording on what is in/out of scope; `package.json` exports + size-limit + peerDeps. |
-| 4 | **[high — type safety]** `Rule.action` is a flat union of every action across every resource — `{ resource: 'billing', action: 'publish' }` is currently type-correct even though `publish` lives on `post`. Breaks the §4.4 "no string-typed escape hatch" promise. | **Agreed.** `Rule<P>` is now a distributive type: `{ [R in InferResources<P>]: RuleFor<P, R> }[InferResources<P>]` where `RuleFor<P, R>['action']` narrows to `InferActions<P, R>`. Wildcard rules (`resource: '*'`) require `action: '*'` — split into a separate `WildcardRule<P>` branch. Added `tests/types/rule-narrowing.test-d.ts`. | §4.2 (`Rule`/`RuleFor`/`WildcardRule` rewritten); §4.4 (added row to compile-time guarantees table); §1 added `tests/types/rule-narrowing.test-d.ts`; §9.1 #10. |
-| 5 | **[high — Edge runtime]** `process?.env?.NODE_ENV` still throws `ReferenceError` in Cloudflare Workers / Deno where `process` is undeclared — optional chaining only protects against `null`/`undefined`. The §9.7 #38 smoke test will pass while real Workers blow up. | **Agreed.** Centralized all `process` access in `src/utils/env.ts` (`isProduction()`, `isDev()`) using `typeof process !== 'undefined' && process?.env?.NODE_ENV …`. Added Biome `no-restricted-syntax` rule banning direct `process.*` reads outside that file; CI fails on violation. Smoke test now explicitly exercises the dev-mode warning code paths. | §1 added `src/utils/env.ts`; §3.1 dep rule #8; §6.2 (Edge-safe runtime feature detection bullet rewritten); §9.4 #28; §9.7 #44. |
-| 6 | **[medium — bundle]** `AbilityBuilder` lives in `core/` and is exported from the public barrel; the 95 % of callers using `definePolicy()` literals pay for its method-chained mutable state. Same argument applies to `serialize()`. | **Agreed.** Moved `AbilityBuilder` to its own subpath `@authkit/permissions/builder` (separate `src/builder/index.ts`, `< 0.8 KB` budget). Converted `serialize()` from a `Permissions` method to a free function `serialize(permissions)` exported from the root barrel — tree-shakes when unused. | §1 layout (`core/builder.ts` removed, `src/builder/` added; `core/serialize.ts` added); §2.2 (`serialize()` removed from interface, note explaining why); §2.6 (rewritten — subpath import); §3.1 module graph + dep rule #5; §6.1 entry table + budgets; §6.2 tactics; §6.3 exports map; §8.3 tsup; `package.json` exports + size-limit. |
-| 7 | **[medium — security/compliance]** Audit hook throwing is silently swallowed. For SOC2 customers the audit log IS the compliance artifact — silently dropping events is a finding waiting to happen. | **Agreed.** Added `PolicyOptions.auditFailureMode: 'log' \| 'throw' \| 'deny'`. Default `'log'` preserves the UI-gating-friendly behaviour. `'throw'` rethrows wrapped in a new `AuditError`. `'deny'` forces the decision to `allowed: false, reason: 'condition_threw'` for fail-closed strict shops. | §2.7 (auditFailureMode option + behaviour table); §4.2 `PolicyOptions.auditFailureMode`; §5.1 (new `AuditError`, `AUDIT_FAILED` code); §5.2 (three new rows); §9.6 #37; §1 added `tests/audit/failure-mode.test.ts`. |
-| 8 | **[medium — naming consistency]** Five different verb patterns for adapter middleware (`protectRoute`, `honoPermissions`, `expressPermissions`, `fastifyPermissions`, `PermissionsGuard`, `createProtectedProcedure`). | **Agreed.** Standardized on **`<framework>Permissions()`** for the request-level middleware factory across all server adapters: `nextPermissions`, `honoPermissions`, `expressPermissions`, `fastifyPermissions`, `trpcPermissions`. Reserved `protect*` / `require*` verbs for **per-route** helpers (`protectRoute`, `requirePermission`, `@RequirePermission`). NestJS keeps `PermissionsModule.forRoot()` since modules don't fit the middleware factory pattern. | §1 (`adapters/next/middleware.ts` exports `nextPermissions`; `adapters/trpc/index.ts` exports `trpcPermissions`); §2.8 (added the naming table; updated tRPC and other examples). |
-| 9 | **[medium — naming]** `abilityFor(subject): ScopedAbility<T>` — factory verb says "ability", return type says "ScopedAbility". | **Agreed.** Renamed the type to `Ability<T, TInstances>` (matches CASL precedent and the verb of the factory). The `ScopedAbility` name is gone. | §2.2 (return type); §2.3 (interface name + every reference); §3.1 module graph; §1 file naming unchanged (`core/ability.ts`); cross-section terminology audit. |
-| 10 | **[medium — type safety]** `ConditionFn`'s `target` is typed `ResourceInstance` regardless of which resource the rule applies to — conditions are essentially untyped. | **Agreed.** Threaded a second type parameter through `definePolicy<TPolicy, TInstances>`: `TInstances extends ResourceInstanceMap<TPolicy>` lets consumers declare per-resource shapes (e.g. `{ post: Post; comment: Comment }`). `CheckArgs<P, R, A, TInstances>` now types `target?` as `TInstances[R]`, and inside a `'post'` rule's `condition` the `target` is narrowed to `Post`. Added `tests/types/instance-typing.test-d.ts`. | §2.1 (signature + example); §2.2 (`Permissions<TPolicy, TInstances>`); §2.3 `Ability<TPolicy, TInstances>`; §2.5 (`CheckArgs` typed `target`); §4.1 (`ResourceInstanceMap`, `DefaultInstances`); §4.3 (per-resource target paragraph); §4.4 (added row); §1 added `src/types/instances.ts` + test. |
-| 11 | **[medium — semantics]** Rule ordering is implicit; once you have 200 rules and a refactor reorders one of them, behaviour shifts silently. | **Agreed.** Added `Rule.priority?: number` (default `0`, higher wins) AND documented the deterministic tiebreak: ties resolved by insertion order, later rule overrides earlier within the same priority bucket. The contract is in §4.2; §9.3 #22 records it as a tested edge case. | §4.2 (added `priority` to `RuleFor` + `WildcardRule`); §2.5 `Decision.matchedRule` includes `priority`; §2.6 builder `.priority(value)` chain method; §9.3 #22; §1 added `tests/core/evaluator.test.ts` covers priority + insertion order. |
-| 12 | **[low — DX]** `tenantId` is required on every call even for single-tenant apps that pass a dummy `'global'` constant. Friction for a common case. | **Agreed.** Made `Subject.tenantId?: string`. With `strictTenant: true` (default), runtime requires non-empty `tenantId`. With `strictTenant: false`, the field can be omitted entirely and the tenant guard is bypassed — single-tenant users opt out **once at policy construction time** and stop threading the dummy through every call. | §2.4 (`tenantId?: string` + the runtime requirement note); §4.4 (compile-time-vs-runtime row); §9.2 #11–#12. |
-| 13 | **[low — semantics]** `fields: []` with `allowed: true` is a silent-permit footgun (every reader will misread "empty whitelist" as "all fields"). | **Agreed (chose the stricter option).** `fields` is typed as a non-empty tuple `readonly [string, ...string[]]`; empty arrays are **rejected at construction time** with `PolicyError('EMPTY_FIELDS')`. `Decision.fields` is therefore either `undefined` or non-empty. | §2.5 `Decision.fields` doc updated; §4.2 `Rule.fields` typed `[string, ...string[]]`; §4.4 row added; §5.1 new error code; §5.2 row; §9.1 #9 (replaces previous #20); §9.3 #25. |
-| 14 | **[low — package.json]** `arethetypeswrong` is the unscoped name; the published package is `@arethetypeswrong/cli`. Plus `tsd` and `vitest --typecheck` overlap. | **Agreed.** Replaced `arethetypeswrong` → `@arethetypeswrong/cli` in `devDependencies`. Dropped `tsd` — `vitest run --typecheck` against the existing `*.test-d.ts` files is sufficient. | `package.json` `devDependencies`; §7.3 wording. |
-| 15 | **[low — terminology]** `combiningAlgorithm: 'deny-overrides' \| 'allow-overrides'` is XACML jargon; the target audience is senior backend devs, not policy engineers. | **Agreed.** Renamed `PolicyOptions.combiningAlgorithm` → `precedence: 'deny' \| 'allow'`. Shorter, no Wikipedia tab, same semantics. The rename is breaking, but no source file shipped yet — perfect time to do it. | §3.3 (Strategy bullet); §4.2 `PolicyOptions.precedence`; §1 evaluator file comment; §9.3 #21. |
-
-**No disagreements** — every reviewer point was actionable and the
-resolutions above represent the authoritative new design.
-
-The "What's good" callouts (multi-tenant as first-class, `<const TPolicy>`,
-two-track error model, `size-limit` per entry, edge-runtime smoke test,
-edge-case enumeration, `PermissionError.toResponse()`, `serialize()`
-dropping conditions, ReBAC out of scope) are preserved unchanged in the
-revised plan — they remain the wedge against CASL/Casbin.
+The IDE autocompletes `'update'` after the user types `action: '`, autocompletes
+`'document'` after `resource: '`, and underlines a typo the second the user
+looks away. That is the entire promise of the library.
