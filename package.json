@@ -36,9 +36,6 @@
       "types": "./dist/builder/index.d.ts",
       "import": "./dist/builder/index.js"
     },
-    "./types": {
-      "types": "./dist/types/index.d.ts"
-    },
     "./adapters/next": {
       "types": "./dist/adapters/next/index.d.ts",
       "import": "./dist/adapters/next/index.js"
