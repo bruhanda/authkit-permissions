@@ -1,24 +1,40 @@
 export type {
-  PolicyDefinition,
-  Rule,
-  RuleFor,
-  WildcardRule,
-  RuleLike,
-  RoleDefinition,
-  ResourceDefinition,
-  PolicyOptions,
-  NormalizedRule,
+  Policy,
+  PolicySpec,
+  ResourceDef,
+  ResourcePermissions,
+  RoleDef,
+  RuleDef,
+  RuleObject,
 } from './policy.js';
 export type { Subject } from './subject.js';
-export type { Decision, DecisionReason, MatchedRule } from './decision.js';
-export type { ConditionFn, ConditionArgs, DeclarativeCondition } from './condition.js';
-export type { ResourceInstance } from './instances.js';
 export type {
-  InferRoles,
-  InferResources,
+  AsyncConditionFn,
+  ConditionArgs,
+  ConditionEntry,
+  ConditionFn,
+  TaggedAsyncCondition,
+  TaggedSyncCondition,
+} from './condition.js';
+export type {
+  CheckArgs,
+  ResourceData,
+  ResourceDataMap,
+} from './context.js';
+export type {
+  AuditDecision,
+  AuditEvent,
+  AuditHook,
+  AuditReason,
+} from './audit.js';
+export type { Decision, DenyReason } from './result.js';
+export type {
   InferActions,
-  ActionsByResource,
-  ResourceInstanceMap,
-  DefaultInstances,
+  InferConditionMap,
+  InferConditions,
+  InferResources,
+  InferRoles,
 } from './inference.js';
-export type { CheckArgs, AbilityCheckArgs, AnyResourceAction } from './check-args.js';
+export type { ValidatePolicy } from './validate.js';
+export type { CompiledRule, EffectivePermissions } from './effective.js';
+export type { FilterAst } from './filter.js';

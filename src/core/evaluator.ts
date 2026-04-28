@@ -1,229 +1,220 @@
-import type { Decision } from '../types/decision.js';
-import type { ResourceInstance } from '../types/instances.js';
-import type { NormalizedRule, PolicyOptions } from '../types/policy.js';
-import type { Subject } from '../types/subject.js';
-import { runConditionAsync, runConditionSync } from './condition.js';
-import { makeDecision } from './decision.js';
-import { matches, matchesAny } from './matcher.js';
-import type { RoleGraph } from './role-graph.js';
+import { PermissionError } from '../errors/base.js';
+import { ERROR_CODES } from '../errors/codes.js';
+import { isDev } from '../utils/env.js';
+import type { ConditionArgs, ConditionEntry } from '../types/condition.js';
+import type { RuleDef } from '../types/policy.js';
+import { isSyncCondition } from './conditions.js';
 
 /**
- * Compiled, query-friendly representation of a policy.
- *
- * The evaluator iterates `rules` in `(priority desc, order asc)` order,
- * stopping at the first applicable verdict. `roleGraph` is attached so
- * `Permissions` can expand a subject's assigned roles to the full closure
- * of inherited roles before matching.
+ * Map of condition name → resolved condition function (with policy
+ * defaults merged with `EnforcerOptions.conditions` overrides).
  */
-export interface CompiledPolicy {
-  readonly rules: readonly NormalizedRule[];
-  readonly options: Readonly<PolicyOptions>;
-  readonly roleGraph: RoleGraph;
-  /** Stable id of the policy version (for audit). */
-  readonly id?: string;
+export type ConditionMap = Record<string, ConditionEntry>;
+
+/** Mutable trace state populated as a rule is walked. */
+export interface RuleEvalState {
+  /** First condition that returned a non-boolean value. */
+  nonBooleanCondition?: string;
+  /** Most recent condition that returned `false`. */
+  failedCondition?: string;
+  /** First condition that threw / rejected. */
+  threwCondition?: string;
+  /** Original error captured from the throwing condition. */
+  threwCause?: unknown;
 }
 
-/**
- * Args for a single decision pass — fully resolved (no inference) so the
- * evaluator stays small and cheap to test in isolation.
- */
-export interface EvaluateArgs {
-  readonly compiled: CompiledPolicy;
-  readonly effectiveRoles: readonly string[];
-  readonly resource: string;
-  readonly action: string;
-  readonly subject: Subject;
-  readonly target: ResourceInstance | undefined;
-  readonly context: Readonly<Record<string, unknown>>;
-  readonly now: () => Date;
+/** Evaluation context shared by the sync and async walkers. */
+export interface EvalContext {
+  readonly conditions: ConditionMap;
+  readonly args: ConditionArgs;
 }
 
-interface Candidate {
-  readonly rule: NormalizedRule;
-  readonly role: string;
-}
-
-/**
- * Synchronous decision pass. If a rule's condition returns a Promise the
- * evaluator surfaces `condition_failed` with `warning: 'async_condition_in_sync_check'`.
- */
-export function evaluateSync(args: EvaluateArgs): Decision {
-  const start = nowMs();
-
-  const candidates = collectCandidates(args);
-  if (candidates.length === 0) {
-    return makeDecision(false, 'no_matching_rule', { durationMs: nowMs() - start });
-  }
-
-  const precedence = args.compiled.options.precedence ?? 'deny';
-  let asyncWarning = false;
-  let conditionThrew: { rule: NormalizedRule; role: string; cause: unknown } | undefined;
-
-  for (const c of candidates) {
-    const outcome = runConditionSync(c.rule.condition, {
-      subject: args.subject,
-      target: args.target,
-      context: args.context,
-      tenantId: args.subject.tenantId,
-      now: args.now,
-    });
-
-    if (outcome.kind === 'matched') {
-      const allowed = c.rule.effect === 'allow';
-      if (allowed) {
-        return makeDecision(true, 'allowed_by_rule', {
-          rule: c.rule,
-          matchedRole: c.role,
-          matchedResource: args.resource,
-          matchedAction: args.action,
-          ...(c.rule.fields ? { fields: c.rule.fields } : {}),
-          durationMs: nowMs() - start,
-        });
-      }
-      if (precedence === 'deny') {
-        return makeDecision(false, 'denied_by_rule', {
-          rule: c.rule,
-          matchedRole: c.role,
-          matchedResource: args.resource,
-          matchedAction: args.action,
-          durationMs: nowMs() - start,
-        });
-      }
-      // precedence === 'allow' — keep scanning for an explicit allow
-      continue;
+/** Walk a `RuleDef` and collect every condition name it references. */
+export function collectConditionRefs(rule: RuleDef): string[] {
+  const out: string[] = [];
+  const walk = (node: RuleDef | string): void => {
+    if (node === true) return;
+    if (typeof node === 'string') {
+      out.push(node);
+      return;
     }
-
-    if (outcome.kind === 'threw') {
-      conditionThrew ??= { rule: c.rule, role: c.role, cause: outcome.cause };
-      continue;
-    }
-
-    if (outcome.kind === 'async_in_sync') {
-      asyncWarning = true;
-      continue;
-    }
-    // 'failed' — fall through to the next candidate.
-  }
-
-  if (conditionThrew) {
-    return makeDecision(false, 'condition_threw', {
-      rule: conditionThrew.rule,
-      matchedRole: conditionThrew.role,
-      matchedResource: args.resource,
-      matchedAction: args.action,
-      durationMs: nowMs() - start,
-    });
-  }
-  if (asyncWarning) {
-    return makeDecision(false, 'condition_failed', {
-      durationMs: nowMs() - start,
-      warning: 'async_condition_in_sync_check',
-    });
-  }
-  return makeDecision(false, 'no_matching_rule', { durationMs: nowMs() - start });
-}
-
-/**
- * Async decision pass — same semantics but conditions may return Promises.
- */
-export async function evaluateAsync(args: EvaluateArgs): Promise<Decision> {
-  const start = nowMs();
-  const candidates = collectCandidates(args);
-  if (candidates.length === 0) {
-    return makeDecision(false, 'no_matching_rule', { durationMs: nowMs() - start });
-  }
-
-  const precedence = args.compiled.options.precedence ?? 'deny';
-  let conditionThrew: { rule: NormalizedRule; role: string; cause: unknown } | undefined;
-
-  for (const c of candidates) {
-    const outcome = await runConditionAsync(c.rule.condition, {
-      subject: args.subject,
-      target: args.target,
-      context: args.context,
-      tenantId: args.subject.tenantId,
-      now: args.now,
-    });
-
-    if (outcome.kind === 'matched') {
-      const allowed = c.rule.effect === 'allow';
-      if (allowed) {
-        return makeDecision(true, 'allowed_by_rule', {
-          rule: c.rule,
-          matchedRole: c.role,
-          matchedResource: args.resource,
-          matchedAction: args.action,
-          ...(c.rule.fields ? { fields: c.rule.fields } : {}),
-          durationMs: nowMs() - start,
-        });
-      }
-      if (precedence === 'deny') {
-        return makeDecision(false, 'denied_by_rule', {
-          rule: c.rule,
-          matchedRole: c.role,
-          matchedResource: args.resource,
-          matchedAction: args.action,
-          durationMs: nowMs() - start,
-        });
-      }
-      continue;
-    }
-
-    if (outcome.kind === 'threw') {
-      conditionThrew ??= { rule: c.rule, role: c.role, cause: outcome.cause };
-      continue;
-    }
-  }
-
-  if (conditionThrew) {
-    return makeDecision(false, 'condition_threw', {
-      rule: conditionThrew.rule,
-      matchedRole: conditionThrew.role,
-      matchedResource: args.resource,
-      matchedAction: args.action,
-      durationMs: nowMs() - start,
-    });
-  }
-  return makeDecision(false, 'no_matching_rule', { durationMs: nowMs() - start });
-}
-
-/**
- * Build the prioritized candidate list. A rule is a candidate when ALL three
- * of `(role, resource, action)` match. Ordering: priority desc, insertion
- * order asc.
- */
-function collectCandidates(args: EvaluateArgs): readonly Candidate[] {
-  const out: Candidate[] = [];
-  for (const rule of args.compiled.rules) {
-    if (!matchesAny(args.effectiveRoles, rule.roles)) continue;
-    if (!matches(args.resource, rule.resources)) continue;
-    if (!matches(args.action, rule.actions)) continue;
-
-    const matchedRole = pickMatchedRole(args.effectiveRoles, rule.roles);
-    out.push({ rule, role: matchedRole });
-  }
-  out.sort((a, b) => {
-    if (a.rule.priority !== b.rule.priority) return b.rule.priority - a.rule.priority;
-    return a.rule.order - b.rule.order;
-  });
+    if ('when' in node) out.push(node.when);
+    else if ('allOf' in node) for (const part of node.allOf) walk(part);
+    else if ('anyOf' in node) for (const part of node.anyOf) walk(part);
+    else if ('not' in node) walk(node.not);
+  };
+  walk(rule);
   return out;
 }
 
-function pickMatchedRole(
-  effective: readonly string[],
-  ruleRoles: readonly string[],
-): string {
-  const set = new Set(ruleRoles);
-  for (const r of effective) {
-    if (set.has(r)) return r;
-  }
-  return ruleRoles[0] ?? '';
+/**
+ * Evaluate a rule **synchronously**.
+ *
+ * Throws `PermissionError(ASYNC_CONDITION_IN_SYNC_PATH)` when the rule
+ * references any condition that is not tagged sync — surfaces the bug
+ * at call time instead of via a silent allow / deny (plan §9.2.7).
+ *
+ * @param rule - the rule node.
+ * @param ctx - resolved condition map and per-call args.
+ * @param state - mutable trace populated for the audit reason picker.
+ * @returns `true` when the rule grants access.
+ * @throws {@link PermissionError} `ASYNC_CONDITION_IN_SYNC_PATH`,
+ *   `UNKNOWN_CONDITION`.
+ */
+export function evalRuleSync(
+  rule: RuleDef,
+  ctx: EvalContext,
+  state: RuleEvalState,
+): boolean {
+  return walkSync(rule, ctx, state);
 }
 
-const nowMs = (): number => {
-  // performance.now() is available in Node 18+, browsers, Workers and Deno.
-  if (typeof performance !== 'undefined' && typeof performance.now === 'function') {
-    return performance.now();
+/**
+ * Evaluate a rule **asynchronously**. Catches throws / rejections from
+ * conditions and records them in `state` (the engine then denies and
+ * audits with `cause` — never re-throws to the caller).
+ */
+export async function evalRuleAsync(
+  rule: RuleDef,
+  ctx: EvalContext,
+  state: RuleEvalState,
+): Promise<boolean> {
+  return walkAsync(rule, ctx, state);
+}
+
+function walkSync(node: RuleDef | string, ctx: EvalContext, state: RuleEvalState): boolean {
+  if (node === true) return true;
+  if (typeof node === 'string') return runOneSync(node, ctx, state);
+  if ('when' in node) return runOneSync(node.when, ctx, state);
+  if ('allOf' in node) {
+    for (const part of node.allOf) {
+      if (!walkSync(part, ctx, state)) return false;
+    }
+    return true;
   }
-  return Date.now();
-};
+  if ('anyOf' in node) {
+    let anyPassed = false;
+    for (const part of node.anyOf) {
+      const inner: RuleEvalState = {};
+      if (walkSync(part, ctx, inner)) {
+        anyPassed = true;
+        break;
+      }
+    }
+    return anyPassed;
+  }
+  // `not`
+  const inner: RuleEvalState = {};
+  const result = walkSync(node.not, ctx, inner);
+  return !result;
+}
+
+async function walkAsync(
+  node: RuleDef | string,
+  ctx: EvalContext,
+  state: RuleEvalState,
+): Promise<boolean> {
+  if (node === true) return true;
+  if (typeof node === 'string') return runOneAsync(node, ctx, state);
+  if ('when' in node) return runOneAsync(node.when, ctx, state);
+  if ('allOf' in node) {
+    for (const part of node.allOf) {
+      const ok = await walkAsync(part, ctx, state);
+      if (!ok) return false;
+    }
+    return true;
+  }
+  if ('anyOf' in node) {
+    for (const part of node.anyOf) {
+      const inner: RuleEvalState = {};
+      const ok = await walkAsync(part, ctx, inner);
+      if (ok) return true;
+      if (state.failedCondition === undefined && inner.failedCondition !== undefined) {
+        state.failedCondition = inner.failedCondition;
+      }
+    }
+    return false;
+  }
+  // `not`
+  const inner: RuleEvalState = {};
+  const ok = await walkAsync(node.not, ctx, inner);
+  if (inner.threwCondition !== undefined) {
+    state.threwCondition = inner.threwCondition;
+    state.threwCause = inner.threwCause;
+    return false;
+  }
+  return !ok;
+}
+
+function lookup(name: string, ctx: EvalContext): ConditionEntry {
+  const fn = ctx.conditions[name];
+  if (fn === undefined) {
+    throw new PermissionError(
+      ERROR_CODES.UNKNOWN_CONDITION,
+      `Unknown condition "${name}" referenced from a rule`,
+      { conditionName: name },
+    );
+  }
+  return fn;
+}
+
+function runOneSync(name: string, ctx: EvalContext, state: RuleEvalState): boolean {
+  const fn = lookup(name, ctx);
+  if (!isSyncCondition(fn)) {
+    throw new PermissionError(
+      ERROR_CODES.ASYNC_CONDITION_IN_SYNC_PATH,
+      `Condition "${name}" is not tagged sync; use defineCondition() or call enforcer.check() instead of checkSync()`,
+      { conditionName: name },
+    );
+  }
+  let value: unknown;
+  try {
+    value = (fn as (a: ConditionArgs) => boolean)(ctx.args);
+  } catch (err) {
+    state.threwCondition = name;
+    state.threwCause = err;
+    return false;
+  }
+  if (value === true) return true;
+  if (value !== false) {
+    state.nonBooleanCondition = name;
+    if (isDev()) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[authkit/permissions] Condition "${name}" returned a non-boolean value (${typeof value}); treating as deny.`,
+      );
+    }
+  } else {
+    state.failedCondition = name;
+  }
+  return false;
+}
+
+async function runOneAsync(
+  name: string,
+  ctx: EvalContext,
+  state: RuleEvalState,
+): Promise<boolean> {
+  const fn = lookup(name, ctx);
+  let value: unknown;
+  try {
+    value = await (fn as (a: ConditionArgs) => boolean | Promise<boolean>)(ctx.args);
+  } catch (err) {
+    state.threwCondition = name;
+    state.threwCause = err;
+    return false;
+  }
+  if (value === true) return true;
+  if (value !== false) {
+    state.nonBooleanCondition = name;
+    if (isDev()) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[authkit/permissions] Condition "${name}" returned a non-boolean value (${typeof value}); treating as deny.`,
+      );
+    }
+  } else {
+    state.failedCondition = name;
+  }
+  return false;
+}

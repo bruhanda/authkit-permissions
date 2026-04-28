@@ -1,45 +1,25 @@
 /**
- * The ONLY module allowed to read `process` / runtime globals. All other
- * source files import `isProduction()` / `isDev()` from here.
+ * Detect dev mode in a runtime-portable way.
  *
- * Cloudflare Workers and Deno do not declare `process` at all — direct
- * `process.env.NODE_ENV` reads throw `ReferenceError`. The `typeof process`
- * guard is the only portable check.
+ * Cloudflare Workers and Deno do **not** declare `process` as a global at
+ * all, so naive `process?.env?.NODE_ENV` references throw `ReferenceError`
+ * — optional chaining only protects against `null`/`undefined`, not
+ * undeclared identifiers. The only safe form is the `typeof` guard below.
+ *
+ * Direct `process.env` reads anywhere else in the package are banned (see
+ * plan §9.3.1). All env probes go through this helper.
+ *
+ * @returns `true` when running outside production (or when `process` does
+ *   not exist at all — Workers, Deno isolates).
+ *
+ * @example
+ *   if (isDev()) console.warn('non-boolean condition result');
  */
-const hasProcess = (): boolean => typeof process !== 'undefined';
-
-/**
- * Returns `true` when running in a NODE_ENV=production environment.
- * Edge runtimes that do not expose `process` are treated as production
- * (no dev warnings — keeps cold-start logs quiet).
- */
-export const isProduction = (): boolean => {
-  if (!hasProcess()) return true;
-  const env = process.env;
-  return env != null && env.NODE_ENV === 'production';
-};
-
-/**
- * Returns `true` when running in a non-production environment.
- * Used to gate dev-only `console.warn` paths.
- */
-export const isDev = (): boolean => !isProduction();
-
-const warnedKeys = new Set<string>();
-
-/**
- * `console.warn` exactly once per process for a given `key`. Used by the
- * dev warnings on async-condition-in-sync-check, unknown roles, etc.
- */
-export const warnOnce = (key: string, ...args: unknown[]): void => {
-  if (!isDev()) return;
-  if (warnedKeys.has(key)) return;
-  warnedKeys.add(key);
-  // eslint-disable-next-line no-console
-  console.warn(...args);
-};
-
-/** Test-only — clears the once-warning cache. */
-export const __resetWarnOnceForTests = (): void => {
-  warnedKeys.clear();
-};
+export function isDev(): boolean {
+  return (
+    typeof process !== 'undefined' &&
+    typeof process.env === 'object' &&
+    process.env !== null &&
+    process.env.NODE_ENV !== 'production'
+  );
+}

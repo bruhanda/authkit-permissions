@@ -1,137 +1,113 @@
-import type { ConditionFn, DeclarativeCondition } from './condition.js';
-import type { InferActions, InferResources, InferRoles } from './inference.js';
+import type { ConditionEntry } from './condition.js';
 
 /**
- * Top-level shape of a policy literal passed to `definePolicy()`.
+ * Definition of a single role in the policy.
+ *
+ * Roles inherit permissions from `extends` via a transitive closure
+ * compiled at `definePolicy()` time. Cycles, self-extension, and
+ * unknown role references throw `INVALID_POLICY` / `ROLE_CYCLE` /
+ * `UNKNOWN_ROLE` at definition time.
  */
-export interface PolicyDefinition<
-  TRole extends string = string,
-  TResource extends string = string,
-  TAction extends string = string,
-> {
-  readonly roles: Readonly<Record<TRole, RoleDefinition<TRole>>>;
-  readonly resources: Readonly<Record<TResource, ResourceDefinition<TAction>>>;
-  readonly rules: ReadonlyArray<RuleLike<TRole, TResource, TAction>>;
-  readonly options?: PolicyOptions;
+export interface RoleDef<TRole extends string = string> {
+  /** Roles this role inherits permissions from. */
+  readonly extends?: ReadonlyArray<TRole>;
+  /** Optional human-readable description for audit/UX. */
+  readonly description?: string;
+  /**
+   * Allow checks across tenants. Default `false`. **Audit-flagged** when
+   * `true`. By itself, `crossTenant: true` does NOT bypass the tenant
+   * guard — every cross-tenant call site must additionally pass
+   * `allowCrossTenant: true` (defence in depth, plan §9.2.4).
+   */
+  readonly crossTenant?: boolean;
+}
+
+/** Definition of a single resource type. */
+export interface ResourceDef<TAction extends string = string> {
+  /** Closed set of actions valid on this resource. */
+  readonly actions: ReadonlyArray<TAction>;
+  /** Optional description for audit-friendly serialisation. */
+  readonly description?: string;
 }
 
 /**
- * Loose rule shape used when the literal type isn't known yet (e.g. the
- * `PolicyDefinition` constraint). The strict, distributive `Rule<P>` below
- * narrows `action` to the resource it belongs to and is what consumers
- * actually see when they pass a literal policy through `definePolicy`.
+ * Composable rule shape. Symmetrical so users never have to remember
+ * which combinator is implicit:
+ *
+ *   - `true`             — unconditional allow
+ *   - `{ when: TCond }`  — sugar for `{ allOf: [TCond] }`
+ *   - `{ allOf: [...] }` — every condition / nested rule must pass
+ *   - `{ anyOf: [...] }` — at least one must pass
+ *   - `{ not: <Rule> }`  — boolean inverse of a nested rule
+ *
+ * Combinators nest, so `(owner OR admin) AND sameTenant` is just
+ * `{ allOf: [{ anyOf: ['owner', 'admin'] }, 'sameTenant'] }`.
  */
-export interface RuleLike<
-  TRole extends string = string,
-  TResource extends string = string,
-  TAction extends string = string,
-> {
-  readonly role: TRole | readonly TRole[];
-  readonly resource: TResource | readonly TResource[] | '*';
-  readonly action: TAction | readonly TAction[] | '*';
-  readonly effect?: 'allow' | 'deny';
-  readonly condition?: ConditionFn | DeclarativeCondition;
-  readonly fields?: readonly [string, ...string[]];
+export type RuleDef<TCond extends string = string> =
+  | true
+  | { readonly when: TCond }
+  | { readonly allOf: ReadonlyArray<TCond | RuleDef<TCond>> }
+  | { readonly anyOf: ReadonlyArray<TCond | RuleDef<TCond>> }
+  | { readonly not: TCond | RuleDef<TCond> };
+
+/**
+ * Wrapper that attaches an explicit `priority` to a rule.
+ *
+ * Higher priority wins; equal priority resolves by declaration order in
+ * the policy literal. Default priority is `0`. Making ordering explicit
+ * is an explicit contract (plan §9.2.6) so refactors that re-order keys
+ * do not silently change behaviour.
+ */
+export interface RuleObject<TCond extends string = string> {
+  readonly rule: RuleDef<TCond>;
   readonly priority?: number;
-  readonly description?: string;
-}
-
-export interface RoleDefinition<TRole extends string = string> {
-  readonly description?: string;
-  /** Roles this role inherits from. Order is irrelevant; cycles fail at build. */
-  readonly extends?: readonly TRole[];
-}
-
-export interface ResourceDefinition<TAction extends string = string> {
-  readonly description?: string;
-  readonly actions: readonly TAction[];
 }
 
 /**
- * Policy-wide options.
+ * Permissions granted on a single resource by a single role. Three escalating
+ * shapes:
+ *
+ *   - `string[]` — implicit unconditional allow per action
+ *   - `['*']`     — wildcard, expands to every declared action
+ *   - object form — explicit per-action `RuleDef` / `RuleObject`
  */
-export interface PolicyOptions {
-  /**
-   * Conflict resolution.
-   *   - `'deny'`  (default) — deny-overrides
-   *   - `'allow'`           — allow-overrides
-   */
-  readonly precedence?: 'deny' | 'allow';
+export type ResourcePermissions<
+  R extends ResourceDef,
+  TCond extends string,
+> =
+  | ReadonlyArray<R['actions'][number] | '*'>
+  | ({ readonly [A in R['actions'][number]]?: RuleDef<TCond> | RuleObject<TCond> } & {
+      readonly '*'?: RuleDef<TCond> | RuleObject<TCond>;
+    });
 
-  /**
-   * Default `true`. When `true`, `subject.tenantId` is required at runtime
-   * and a missing/empty value yields `tenant_mismatch`. When `false`,
-   * the tenant guard is bypassed entirely (single-tenant mode).
-   */
-  readonly strictTenant?: boolean;
-
-  /**
-   * Default `false`. Cross-tenant access (super-admin) requires this AND
-   * `subject.crossTenant === true`. With this `false`, setting
-   * `crossTenant` on a subject is a no-op.
-   */
-  readonly allowCrossTenant?: boolean;
-
-  /**
-   * Default `'log'`. Behaviour when an audit hook throws/rejects:
-   *   - `'log'`   — swallow + `console.warn` once; decision unchanged.
-   *   - `'throw'` — rethrow as `AuditError` (caller decides).
-   *   - `'deny'`  — force the decision to `{ allowed: false, reason: 'condition_threw' }`.
-   */
-  readonly auditFailureMode?: 'log' | 'throw' | 'deny';
-
-  /** Throw at definition time if rules reference unknown ids. Default `true`. */
-  readonly strictReferences?: boolean;
-
-  /** Stable identifier for the policy version, written into audit events. */
-  readonly id?: string;
+/**
+ * Top-level shape passed to `definePolicy`.
+ *
+ * Cross-references (`extends`, action keys, condition refs) are tightened
+ * to literal unions by `ValidatePolicy<P>` at the `definePolicy` boundary
+ * — see `types/validate.ts`.
+ */
+export interface PolicySpec {
+  /** Stable identifier written into audit events. */
+  readonly version?: string;
+  readonly roles: { readonly [role: string]: RoleDef };
+  readonly resources: { readonly [resource: string]: ResourceDef };
+  readonly conditions?: { readonly [condition: string]: ConditionEntry };
+  readonly permissions: {
+    readonly [role: string]: {
+      readonly [resource: string]: ResourcePermissions<ResourceDef, string> | undefined;
+    } | undefined;
+  };
 }
 
 /**
- * Distributive `Rule<P>` so when `resource` is the literal `'post'`,
- * `action` is constrained to `InferActions<P, 'post'>`.
+ * Frozen, validated policy handle returned by `definePolicy`.
+ *
+ * The branded `__brand` field makes `Policy<A>` structurally incompatible
+ * with `Policy<B>`, so an enforcer wired to one policy can't be passed a
+ * subject typed for another at compile time.
  */
-export type Rule<P extends PolicyDefinition> =
-  | { [R in InferResources<P>]: RuleFor<P, R> }[InferResources<P>]
-  | WildcardRule<P>;
-
-export type RuleFor<
-  P extends PolicyDefinition,
-  R extends InferResources<P>,
-> = {
-  readonly role: InferRoles<P> | readonly InferRoles<P>[];
-  readonly resource: R | readonly R[];
-  readonly action: InferActions<P, R> | readonly InferActions<P, R>[] | '*';
-  readonly effect?: 'allow' | 'deny';
-  readonly condition?: ConditionFn | DeclarativeCondition;
-  readonly fields?: readonly [string, ...string[]];
-  readonly priority?: number;
-  readonly description?: string;
-};
-
-export type WildcardRule<P extends PolicyDefinition> = {
-  readonly role: InferRoles<P> | readonly InferRoles<P>[];
-  readonly resource: '*';
-  readonly action: '*';
-  readonly effect?: 'allow' | 'deny';
-  readonly condition?: ConditionFn | DeclarativeCondition;
-  readonly priority?: number;
-  readonly description?: string;
-};
-
-/**
- * The internal, normalized representation of a rule after `definePolicy`.
- * Always-array shapes simplify the evaluator.
- */
-export interface NormalizedRule {
-  readonly roles: readonly string[];
-  readonly resources: readonly string[] | '*';
-  readonly actions: readonly string[] | '*';
-  readonly effect: 'allow' | 'deny';
-  readonly condition?: ConditionFn | DeclarativeCondition;
-  readonly fields?: readonly [string, ...string[]];
-  readonly priority: number;
-  readonly description?: string;
-  /** Insertion order — used as the deterministic tiebreaker. */
-  readonly order: number;
+export interface Policy<P extends PolicySpec> {
+  readonly spec: P;
+  readonly __brand: 'authkit/policy';
 }

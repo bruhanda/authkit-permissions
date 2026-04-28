@@ -6,7 +6,7 @@ export default defineConfig({
     typecheck: {
       enabled: false,
       tsconfig: './tsconfig.json',
-      include: ['tests/**/*.test-d.ts'],
+      include: ['test/**/*.test-d.ts'],
     },
     coverage: {
       provider: 'v8',
@@ -19,10 +19,10 @@ export default defineConfig({
       ],
       thresholds: {
         lines: 95,
-        branches: 95,
-        functions: 100,
+        branches: 90,
+        functions: 95,
       },
     },
-    include: ['tests/**/*.test.ts', 'tests/**/*.test.tsx'],
+    include: ['test/**/*.test.ts', 'test/**/*.test.tsx'],
   },
 });

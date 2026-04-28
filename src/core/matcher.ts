@@ -1,38 +1,18 @@
 /**
- * Pure matching helpers. The evaluator uses these to decide whether a
- * normalized rule applies to a `(role, resource, action)` triple.
- */
-
-/**
- * Returns `true` when `value` is in `pool` or `pool === '*'`.
+ * Match an action key from a permission entry against a requested action.
  *
- * Wildcards never match the empty string — single-letter sentinels can
- * leak into runtime through serialization mistakes, so an empty `value`
- * always returns `false`.
+ * The library uses simple literal matching plus a single `'*'` wildcard.
+ * No regex, no glob — keeps the hot path branch-free and predictable.
+ *
+ * @param declared - action key from the compiled rule (or `'*'`).
+ * @param requested - action requested at the call site.
+ * @returns `true` when the rule applies.
+ *
+ * @example
+ *   actionMatches('*', 'read')      // true
+ *   actionMatches('read', 'read')   // true
+ *   actionMatches('read', 'update') // false
  */
-export const matches = (value: string, pool: readonly string[] | '*'): boolean => {
-  if (value === '') return false;
-  if (pool === '*') return true;
-  if (pool.length === 0) return false;
-  for (const p of pool) {
-    if (p === value) return true;
-  }
-  return false;
-};
-
-/**
- * Returns `true` if any of the values in `subjectValues` is present in `pool`.
- * Used to test whether any of the subject's effective roles matches the
- * `roles` array of a normalized rule.
- */
-export const matchesAny = (
-  subjectValues: Iterable<string>,
-  pool: readonly string[],
-): boolean => {
-  if (pool.length === 0) return false;
-  const set = new Set(pool);
-  for (const v of subjectValues) {
-    if (set.has(v)) return true;
-  }
-  return false;
-};
+export function actionMatches(declared: string, requested: string): boolean {
+  return declared === '*' || declared === requested;
+}

@@ -1,88 +1,51 @@
-import type { Permissions } from '../../core/permissions.js';
-import type {
-  DefaultInstances,
-  InferRoles,
-  ResourceInstanceMap,
-} from '../../types/inference.js';
-import type { PolicyDefinition } from '../../types/policy.js';
+import { PermissionError } from '../../errors/base.js';
+import { ERROR_CODES } from '../../errors/codes.js';
+import type { Enforcer } from '../../core/enforcer.js';
+import type { CheckArgs } from '../../types/context.js';
+import type { InferActions, InferResources, InferRoles } from '../../types/inference.js';
+import type { PolicySpec } from '../../types/policy.js';
 import type { Subject } from '../../types/subject.js';
+import type { NextRequestLike } from './route-handler.js';
 
 /**
- * Subset of the Next.js middleware response surface. We avoid importing
- * `next/server` directly so consumers without Next still type-check.
- */
-export interface NextMiddlewareResponse {
-  readonly status: number;
-  readonly redirect?: string;
-}
-
-export interface NextPermissionsConfig<
-  TPolicy extends PolicyDefinition,
-  TInstances extends ResourceInstanceMap<TPolicy> = DefaultInstances<TPolicy>,
-> {
-  readonly permissions: Permissions<TPolicy, TInstances>;
-  /**
-   * Resolve the request subject. Return `null` to short-circuit with the
-   * configured `unauthorizedRedirect` (or a 401 JSON response).
-   */
-  readonly getSubject: (
-    req: Request,
-  ) => Subject<InferRoles<TPolicy>> | null | Promise<Subject<InferRoles<TPolicy>> | null>;
-  /**
-   * Optional redirect URL when no subject is available. Defaults to a
-   * 401 JSON response.
-   */
-  readonly unauthorizedRedirect?: string;
-}
-
-/**
- * Build a Next.js App Router middleware that resolves the subject on every
- * request and, when missing, either redirects to a configured login page
- * or replies with a 401 JSON response.
+ * Factory for a Next.js App Router `middleware.ts` export that enforces a
+ * permission requirement and passes through (returns `undefined`) when the
+ * subject is allowed.
  *
- * @param config Adapter config — `permissions`, `getSubject`, optional
- *               `unauthorizedRedirect`.
- *
- * @returns A middleware function compatible with `export default` from
- *          `middleware.ts`.
- *
- * @throws Never throws.
+ * On deny, returns a 403 `Response` so the request is short-circuited
+ * before hitting any route handler.
  *
  * @example
- * ```ts
- * // middleware.ts
- * import { nextPermissions } from '@authkit/permissions/adapters/next';
- * import { permissions } from '@/lib/permissions';
- * import { getSessionUser } from '@/lib/session';
- *
- * export default nextPermissions({
- *   permissions,
- *   getSubject: getSessionUser,
- *   unauthorizedRedirect: '/login',
- * });
- * ```
+ *   // middleware.ts
+ *   export const middleware = nextMiddleware(enforcer, {
+ *     getSubject: (req) => sessionFor(req),
+ *     require: (req) => ({ resource: 'document', action: 'read' }),
+ *   });
  */
-export function nextPermissions<
-  TPolicy extends PolicyDefinition,
-  TInstances extends ResourceInstanceMap<TPolicy> = DefaultInstances<TPolicy>,
+export function nextMiddleware<
+  P extends PolicySpec,
+  R extends InferResources<P>,
+  A extends InferActions<P, R>,
 >(
-  config: NextPermissionsConfig<TPolicy, TInstances>,
-): (req: Request) => Promise<Response> {
-  return async (req: Request): Promise<Response> => {
-    const subject = await config.getSubject(req);
-    if (subject) {
-      // Pass-through: in App Router `middleware.ts` returning `undefined`
-      // continues the chain. When the consumer chooses this `Response`
-      // shape (e.g. `NextResponse.next()`) we mimic it by signalling 200.
-      return new Response(null, { status: 200 });
+  enforcer: Enforcer<P>,
+  options: {
+    readonly getSubject: (req: NextRequestLike) => Subject<InferRoles<P>> | Promise<Subject<InferRoles<P>>>;
+    readonly require: (
+      req: NextRequestLike,
+    ) => Omit<CheckArgs<P, R, A>, 'subject'> | Promise<Omit<CheckArgs<P, R, A>, 'subject'>>;
+  },
+): (req: NextRequestLike) => Promise<Response | undefined> {
+  return async (req) => {
+    try {
+      const subject = await options.getSubject(req);
+      const requirement = await options.require(req);
+      await enforcer.enforce({ subject, ...requirement } as CheckArgs<P, R, A>);
+      return undefined;
+    } catch (err) {
+      if (err instanceof PermissionError && err.code === ERROR_CODES.FORBIDDEN) {
+        return new Response('Forbidden', { status: 403 });
+      }
+      throw err;
     }
-    if (config.unauthorizedRedirect) {
-      const url = new URL(config.unauthorizedRedirect, req.url);
-      return Response.redirect(url, 307);
-    }
-    return Response.json(
-      { error: 'Unauthorized', code: 'UNAUTHORIZED' },
-      { status: 401 },
-    );
   };
 }

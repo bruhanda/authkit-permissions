@@ -1,33 +1,33 @@
-import type { Decision } from '../types/decision.js';
-import type { ResourceInstance } from '../types/instances.js';
-import type { Subject } from '../types/subject.js';
+import type { AuditHook } from '../types/audit.js';
 
 /**
- * The payload passed to every `AuditHook` invocation.
+ * Compose multiple audit hooks into one. Hooks run **left-to-right** and
+ * any rejection from any hook propagates after the previous ones have
+ * resolved (errors are aggregated into a single rejection).
  *
- * Every field except the boolean flags is a stable, machine-readable
- * snapshot of the check that just happened.
+ * @param hooks - audit hooks to compose.
+ * @returns a single hook that fans the event out to each child.
+ *
+ * @example
+ *   const audit = composeAudit(
+ *     (event) => logger.info(event),
+ *     (event) => Sentry.addBreadcrumb({ category: 'authz', data: event }),
+ *   );
  */
-export interface AuditEvent {
-  readonly subject: Subject;
-  readonly action: string;
-  readonly resource: string;
-  readonly target?: ResourceInstance;
-  readonly tenantId?: string;
-  /** Present only when the call crossed tenants AND the policy allowed it. */
-  readonly crossTenant?: true;
-  readonly decision: Decision;
-  /** ISO 8601 timestamp captured at the moment of the decision. */
-  readonly timestamp: string;
-  /** Stable id of the policy version, when one was supplied via `PolicyOptions.id`. */
-  readonly policyId?: string;
+export function composeAudit(...hooks: ReadonlyArray<AuditHook>): AuditHook {
+  if (hooks.length === 0) return () => undefined;
+  if (hooks.length === 1) return hooks[0] as AuditHook;
+  return async (event) => {
+    const errors: unknown[] = [];
+    for (const hook of hooks) {
+      try {
+        const result = hook(event);
+        if (result instanceof Promise) await result;
+      } catch (err) {
+        errors.push(err);
+      }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, 'audit hooks failed');
+  };
 }
-
-/**
- * Called once per `check()`/`checkAsync()` after a decision is made.
- *
- * Sync `check()` does not await the returned promise (fire-and-forget);
- * `checkAsync()` does await it. Behaviour when the hook throws is
- * governed by `PolicyOptions.auditFailureMode`.
- */
-export type AuditHook = (event: AuditEvent) => void | Promise<void>;

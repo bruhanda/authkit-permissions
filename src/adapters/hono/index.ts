@@ -1,102 +1,66 @@
-import type { Permissions } from '../../core/permissions.js';
-import type { CheckArgs } from '../../types/check-args.js';
-import type {
-  DefaultInstances,
-  InferActions,
-  InferResources,
-  InferRoles,
-  ResourceInstanceMap,
-} from '../../types/inference.js';
-import type { PolicyDefinition } from '../../types/policy.js';
+import type { Enforcer } from '../../core/enforcer.js';
+import type { CheckArgs } from '../../types/context.js';
+import type { InferActions, InferResources, InferRoles } from '../../types/inference.js';
+import type { PolicySpec } from '../../types/policy.js';
 import type { Subject } from '../../types/subject.js';
-import { PermissionError } from '../../errors/permission-error.js';
 
 /**
- * Minimal subset of the Hono context surface we depend on. Avoids importing
- * `hono` directly so consumers without Hono do not pay the resolution cost.
+ * Minimal Hono context surface used by the adapter.
+ *
+ * Avoids importing `hono` at type level so the package is lint-clean even
+ * when Hono is not installed; consumers using Hono get full structural
+ * compatibility because they pass their own `Context`.
  */
-export interface HonoLikeContext {
-  set(key: string, value: unknown): void;
-  get<T = unknown>(key: string): T;
-  json(body: unknown, status?: number): unknown;
-  req: { method: string; url: string };
+export interface HonoContextLike {
+  readonly executionCtx?: { readonly waitUntil?: (p: Promise<unknown>) => void };
+  readonly var?: Readonly<Record<string, unknown>>;
 }
 
-export type HonoNext = () => Promise<void>;
+/** Hono `MiddlewareHandler` shape. */
+export type HonoMiddleware = (c: HonoContextLike, next: () => Promise<void>) => Promise<unknown> | unknown;
 
-/**
- * Configuration for `honoPermissions()`.
- */
-export interface HonoPermissionsConfig<
-  TPolicy extends PolicyDefinition,
-  TInstances extends ResourceInstanceMap<TPolicy> = DefaultInstances<TPolicy>,
+/** Configuration for the `honoPermissions` middleware factory. */
+export interface HonoPermissionsOptions<
+  P extends PolicySpec,
+  R extends InferResources<P>,
+  A extends InferActions<P, R>,
 > {
-  readonly permissions: Permissions<TPolicy, TInstances>;
-  /**
-   * Resolve the request subject. Return `null` to short-circuit the
-   * middleware with `401`.
-   */
-  readonly getSubject: (c: HonoLikeContext) => Subject<InferRoles<TPolicy>> | null | Promise<Subject<InferRoles<TPolicy>> | null>;
-  /** Optional override for the variable key used to expose the bound ability. */
-  readonly contextKey?: string;
+  /** Pull a `Subject` out of the request context (set by upstream auth middleware). */
+  readonly getSubject: (c: HonoContextLike) => Subject<InferRoles<P>> | Promise<Subject<InferRoles<P>>>;
+  /** Build the resource/action/data triple for this route. */
+  readonly require: (
+    c: HonoContextLike,
+  ) => Omit<CheckArgs<P, R, A>, 'subject'> | Promise<Omit<CheckArgs<P, R, A>, 'subject'>>;
+  /** Optional: forwards `c.executionCtx.waitUntil` to the enforcer's audit hook. */
+  readonly waitUntil?: (c: HonoContextLike) => ((p: Promise<unknown>) => void) | undefined;
 }
 
 /**
- * Build a Hono middleware that exposes a per-request `enforce()` helper
- * via `c.var.enforce(...)` (or the configured `contextKey`).
+ * Build a Hono middleware that enforces a permission requirement.
  *
- * @param config Adapter config — `permissions`, `getSubject`, optional `contextKey`.
- *
- * @returns A Hono middleware function.
- *
- * @throws The middleware itself never throws; downstream handlers may
- *         invoke `enforce()` which throws `PermissionError` on denial.
+ * On allow, calls `next()`. On deny, the underlying `enforcer.enforce`
+ * throws `PermissionError(FORBIDDEN)` and Hono's error handler turns it
+ * into a 403.
  *
  * @example
- * ```ts
- * import { Hono } from 'hono';
- * import { honoPermissions } from '@authkit/permissions/adapters/hono';
- *
- * const app = new Hono();
- * app.use('*', honoPermissions({ permissions, getSubject: (c) => c.get('user') }));
- * app.delete('/posts/:id', (c) => {
- *   c.var.enforce({ action: 'delete', resource: 'post' });
- *   return c.json({ ok: true });
- * });
- * ```
+ *   app.use('/api/*',
+ *     honoPermissions(enforcer, {
+ *       getSubject: (c) => c.var.user,
+ *       require: () => ({ resource: 'document', action: 'read' }),
+ *       waitUntil: (c) => c.executionCtx?.waitUntil,
+ *     }),
+ *   );
  */
 export function honoPermissions<
-  TPolicy extends PolicyDefinition,
-  TInstances extends ResourceInstanceMap<TPolicy> = DefaultInstances<TPolicy>,
->(
-  config: HonoPermissionsConfig<TPolicy, TInstances>,
-): (c: HonoLikeContext, next: HonoNext) => Promise<unknown> {
-  const key = config.contextKey ?? 'enforce';
-
-  return async (c, next): Promise<unknown> => {
-    const subject = await config.getSubject(c);
-    if (!subject) {
-      return c.json({ error: 'Unauthorized', code: 'UNAUTHORIZED' }, 401);
-    }
-
-    const ability = config.permissions.abilityFor(subject);
-    c.set('subject', subject);
-    c.set('ability', ability);
-    c.set(key, <
-      R extends InferResources<TPolicy>,
-      A extends InferActions<TPolicy, R>,
-    >(args: Omit<CheckArgs<TPolicy, R, A, TInstances>, 'subject'>): void => {
-      ability.enforce(args);
-    });
-
-    try {
-      return await next();
-    } catch (err) {
-      if (err instanceof PermissionError) {
-        const r = err.toResponse();
-        return c.json(r.body, r.status);
-      }
-      throw err;
-    }
+  P extends PolicySpec,
+  R extends InferResources<P>,
+  A extends InferActions<P, R>,
+>(enforcer: Enforcer<P>, options: HonoPermissionsOptions<P, R, A>): HonoMiddleware {
+  return async (c, next) => {
+    const subject = await options.getSubject(c);
+    const requirement = await options.require(c);
+    const args = { subject, ...requirement } as CheckArgs<P, R, A>;
+    await enforcer.enforce(args);
+    await next();
   };
 }

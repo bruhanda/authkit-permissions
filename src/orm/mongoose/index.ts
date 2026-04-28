@@ -1,39 +1,47 @@
-import type { AccessibleByFilter } from '../../core/accessible-by.js';
+import type { Subject } from '../../types/subject.js';
 
-/** A MongoDB / Mongoose `filter` document. */
-export type MongoFilter = Record<string, unknown>;
+export { toMongoFilter } from './filter.js';
 
 /**
- * Translate an `AccessibleByFilter` AST to a Mongo filter document.
+ * Configuration for `createMongooseRoleAdapter`.
  *
- * `kind: 'all'` becomes `{}`. `kind: 'none'` becomes `{ _id: { $in: [] } }`,
- * which Mongo short-circuits to an empty result set.
+ * The adapter accepts a query closure (instead of a schema/model pair)
+ * so it works with both Mongoose models and the native MongoDB driver.
+ */
+export interface MongooseRoleAdapterOptions {
+  readonly query: (args: {
+    readonly userId: string;
+    readonly tenantId: string;
+  }) => Promise<ReadonlyArray<{ readonly role: string; readonly crossTenant?: boolean }>>;
+}
+
+/**
+ * Build a role-loader against a Mongoose-backed memberships collection.
  *
- * @param filter The AST returned by `accessibleBy()`.
- *
- * @returns A Mongo filter document.
- *
- * @throws Never throws.
+ * @param options - the membership query closure.
+ * @returns an object with `loadSubject({ userId, tenantId })`.
  *
  * @example
- * ```ts
- * const filter = accessibleBy(ability, { resource: 'post' });
- * const docs = await Post.find(toMongo(filter));
- * ```
+ *   const adapter = createMongooseRoleAdapter({
+ *     query: ({ userId, tenantId }) =>
+ *       Membership.find({ userId, tenantId }, { role: 1, crossTenant: 1 }).lean(),
+ *   });
  */
-export function toMongo(filter: AccessibleByFilter): MongoFilter {
-  switch (filter.kind) {
-    case 'all':
-      return {};
-    case 'none':
-      return { _id: { $in: [] } };
-    case 'eq':
-      return { [filter.field]: filter.value };
-    case 'in':
-      return { [filter.field]: { $in: [...filter.values] } };
-    case 'and':
-      return { $and: filter.filters.map((f) => toMongo(f)) };
-    case 'or':
-      return { $or: filter.filters.map((f) => toMongo(f)) };
-  }
+export function createMongooseRoleAdapter(options: MongooseRoleAdapterOptions): {
+  loadSubject(args: { readonly userId: string; readonly tenantId: string }): Promise<Subject>;
+} {
+  return {
+    async loadSubject({ userId, tenantId }) {
+      const rows = await options.query({ userId, tenantId });
+      const roles = rows.map((row) => row.role).filter((r): r is string => typeof r === 'string');
+      const crossTenant = rows.some((row) => row.crossTenant === true);
+      const subject: { id: string; tenantId: string; roles: string[]; crossTenant?: true } = {
+        id: userId,
+        tenantId,
+        roles,
+      };
+      if (crossTenant) subject.crossTenant = true;
+      return subject as Subject;
+    },
+  };
 }

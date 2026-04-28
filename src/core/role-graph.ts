@@ -1,89 +1,93 @@
-import { PolicyError } from '../errors/policy-error.js';
-import type { RoleDefinition } from '../types/policy.js';
-import { warnOnce } from '../utils/env.js';
+import { PermissionError } from '../errors/base.js';
+import { ERROR_CODES } from '../errors/codes.js';
+import type { PolicySpec } from '../types/policy.js';
 
 /**
- * Compiled role hierarchy used by the evaluator. Maps every declared role
- * to its full set of effective roles (itself plus every transitively
- * inherited role).
+ * Compiled role-hierarchy closure.
+ *
+ * For every declared role, `ancestorsOf` carries the full transitive set of
+ * inherited roles **including the role itself**, in dependency order
+ * (most-specific first, then progressively-more-general parents). The
+ * order matters for deterministic rule resolution (plan §9.2.6).
  */
-export interface RoleGraph {
-  /**
-   * Resolve a list of roles a subject was assigned to the full closure of
-   * effective roles. Unknown roles are silently dropped (with a one-time
-   * dev warning).
-   */
-  expand(assigned: readonly string[]): readonly string[];
-
-  /** All declared role names — used when rules reference an unknown role. */
-  hasRole(role: string): boolean;
+export interface RoleClosure {
+  readonly ancestorsOf: ReadonlyMap<string, ReadonlyArray<string>>;
 }
 
 /**
- * Build a `RoleGraph` from the policy's `roles` map. Throws
- * `PolicyError('CYCLE_DETECTED')` on direct or indirect cycles.
+ * Compile a role hierarchy and return its transitive closure.
+ *
+ * Detects role cycles, self-extension, and unknown role references in
+ * `extends`. Runs a single DFS per role with grey/black colouring so the
+ * cycle path can be reported in the diagnostic.
+ *
+ * @param spec - the policy spec being defined.
+ * @returns frozen closure handle.
+ * @throws {@link PermissionError} `ROLE_CYCLE` when a cycle is detected.
+ * @throws {@link PermissionError} `UNKNOWN_ROLE` when `extends` references
+ *   an undeclared role.
+ *
+ * @example
+ *   const closure = buildRoleClosure(spec);
+ *   const ancestors = closure.ancestorsOf.get('member'); // ['member', 'viewer']
  */
-export function buildRoleGraph(
-  roles: Readonly<Record<string, RoleDefinition>>,
-): RoleGraph {
-  const declared = new Set(Object.keys(roles));
-  const closures = new Map<string, readonly string[]>();
+export function buildRoleClosure(spec: PolicySpec): RoleClosure {
+  const roleNames = Object.keys(spec.roles);
+  const known = new Set(roleNames);
 
-  for (const role of declared) {
-    closures.set(role, computeClosure(role, roles, declared, []));
-  }
-
-  return {
-    hasRole: (role) => declared.has(role),
-    expand: (assigned) => {
-      const out = new Set<string>();
-      for (const role of assigned) {
-        if (out.has(role)) continue;
-        const closure = closures.get(role);
-        if (!closure) {
-          warnOnce(
-            `unknown-role:${role}`,
-            `[@authkit/permissions] Unknown role "${role}" in subject.roles — silently dropped.`,
-          );
-          continue;
-        }
-        for (const r of closure) out.add(r);
+  for (const role of roleNames) {
+    const def = spec.roles[role];
+    if (def?.extends === undefined) continue;
+    for (const parent of def.extends) {
+      if (parent === role) {
+        throw new PermissionError(
+          ERROR_CODES.ROLE_CYCLE,
+          `Role "${role}" extends itself`,
+          { role },
+        );
       }
-      return Array.from(out);
-    },
-  };
-}
-
-function computeClosure(
-  role: string,
-  roles: Readonly<Record<string, RoleDefinition>>,
-  declared: Set<string>,
-  path: readonly string[],
-): readonly string[] {
-  if (path.includes(role)) {
-    throw new PolicyError(
-      'CYCLE_DETECTED',
-      `Role inheritance cycle detected: ${[...path, role].join(' -> ')}`,
-      { path: ['roles', ...path, role] },
-    );
-  }
-
-  const out = new Set<string>([role]);
-  const def = roles[role];
-  const parents = def?.extends ?? [];
-  const nextPath = [...path, role];
-
-  for (const parent of parents) {
-    if (!declared.has(parent)) {
-      throw new PolicyError(
-        'UNKNOWN_ROLE',
-        `Role "${role}" extends unknown role "${parent}".`,
-        { path: ['roles', role, 'extends'] },
-      );
+      if (!known.has(parent)) {
+        throw new PermissionError(
+          ERROR_CODES.UNKNOWN_ROLE,
+          `Role "${role}" extends unknown role "${parent}"`,
+          { role, parent },
+        );
+      }
     }
-    const closure = computeClosure(parent, roles, declared, nextPath);
-    for (const r of closure) out.add(r);
   }
 
-  return Array.from(out);
+  const ancestorsOf = new Map<string, ReadonlyArray<string>>();
+
+  for (const start of roleNames) {
+    const visited = new Set<string>();
+    const stack = new Set<string>();
+    const path: string[] = [];
+    const order: string[] = [];
+
+    const visit = (role: string): void => {
+      if (visited.has(role)) return;
+      if (stack.has(role)) {
+        const at = path.indexOf(role);
+        const trail = [...path.slice(at), role].join(' -> ');
+        throw new PermissionError(
+          ERROR_CODES.ROLE_CYCLE,
+          `Role inheritance cycle detected: ${trail}`,
+          { cycle: trail },
+        );
+      }
+      stack.add(role);
+      path.push(role);
+      order.push(role);
+      const parents = spec.roles[role]?.extends ?? [];
+      for (const p of parents) visit(p);
+      stack.delete(role);
+      path.pop();
+      visited.add(role);
+    };
+
+    visit(start);
+    ancestorsOf.set(start, order);
+  }
+
+  return { ancestorsOf };
 }

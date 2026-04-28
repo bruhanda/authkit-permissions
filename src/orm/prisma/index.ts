@@ -1,44 +1,86 @@
-import type { AccessibleByFilter } from '../../core/accessible-by.js';
+import type { Subject } from '../../types/subject.js';
+
+export { toPrismaWhere } from './filter.js';
 
 /**
- * Prisma `where` clause shape produced by `toPrisma`. Kept as
- * `Record<string, unknown>` so consumers do not need a Prisma type
- * import in their own code paths.
+ * Configuration for `createPrismaRoleAdapter`.
+ *
+ * All field names are configurable so the adapter slots into existing
+ * schemas without forcing a column rename.
  */
-export type PrismaWhere = Record<string, unknown>;
+export interface PrismaRoleAdapterOptions {
+  /** Lowercased model name as it appears on the Prisma client. */
+  readonly membershipModel: string;
+  /** FK column to the user. */
+  readonly userField: string;
+  /** Tenant id column (typically `tenantId` / `organizationId`). */
+  readonly tenantField: string;
+  /** Role column (string or enum mapped to string at the boundary). */
+  readonly roleField: string;
+  /** Optional column that flips `subject.crossTenant` when the row's value is truthy. */
+  readonly crossTenantField?: string;
+}
 
 /**
- * Translate an `AccessibleByFilter` AST to a Prisma `where` clause.
+ * Minimal Prisma client shape used by the adapter — `findMany` on a
+ * configurable model. Avoids importing `@prisma/client` (peer dep) at
+ * type level.
+ */
+export interface PrismaClientLike {
+  readonly [model: string]: {
+    findMany(args: {
+      readonly where: Record<string, unknown>;
+      readonly select?: Record<string, true>;
+    }): Promise<ReadonlyArray<Record<string, unknown>>>;
+  };
+}
+
+/**
+ * Build a role-loader for Prisma-backed memberships.
  *
- * `kind: 'all'` becomes `{}` (no constraint), `kind: 'none'` becomes a
- * predicate that is provably false (`AND: [{ id: null }, { id: { not: null } }]`)
- * so the query returns zero rows without a round trip.
- *
- * @param filter The AST returned by `accessibleBy()`.
- *
- * @returns A Prisma-compatible `where` object.
- *
- * @throws Never throws.
+ * @param prisma - Prisma client instance.
+ * @param options - column-name mapping.
+ * @returns an object with `loadSubject({ userId, tenantId })`.
  *
  * @example
- * ```ts
- * const filter = accessibleBy(ability, { resource: 'post', action: 'read' });
- * const posts = await prisma.post.findMany({ where: toPrisma(filter) });
- * ```
+ *   const adapter = createPrismaRoleAdapter(prisma, {
+ *     membershipModel: 'membership',
+ *     userField: 'userId',
+ *     tenantField: 'tenantId',
+ *     roleField: 'role',
+ *   });
+ *   const subject = await adapter.loadSubject({ userId, tenantId });
  */
-export function toPrisma(filter: AccessibleByFilter): PrismaWhere {
-  switch (filter.kind) {
-    case 'all':
-      return {};
-    case 'none':
-      return { AND: [{ id: null }, { id: { not: null } }] };
-    case 'eq':
-      return { [filter.field]: filter.value };
-    case 'in':
-      return { [filter.field]: { in: [...filter.values] } };
-    case 'and':
-      return { AND: filter.filters.map((f) => toPrisma(f)) };
-    case 'or':
-      return { OR: filter.filters.map((f) => toPrisma(f)) };
-  }
+export function createPrismaRoleAdapter(
+  prisma: PrismaClientLike,
+  options: PrismaRoleAdapterOptions,
+): {
+  loadSubject(args: { readonly userId: string; readonly tenantId: string }): Promise<Subject>;
+} {
+  const { membershipModel, userField, tenantField, roleField, crossTenantField } = options;
+  return {
+    async loadSubject({ userId, tenantId }) {
+      const select: Record<string, true> = { [roleField]: true };
+      if (crossTenantField !== undefined) select[crossTenantField] = true;
+      const rows = await prisma[membershipModel]?.findMany({
+        where: { [userField]: userId, [tenantField]: tenantId },
+        select,
+      });
+      if (rows === undefined) {
+        throw new Error(`Prisma model "${membershipModel}" not found on client`);
+      }
+      const roles = rows
+        .map((row) => row[roleField])
+        .filter((v): v is string => typeof v === 'string');
+      const crossTenant =
+        crossTenantField !== undefined && rows.some((row) => row[crossTenantField] === true);
+      const subject: { id: string; tenantId: string; roles: string[]; attrs?: Record<string, unknown> } = {
+        id: userId,
+        tenantId,
+        roles,
+      };
+      if (crossTenant) (subject as { crossTenant?: boolean }).crossTenant = true;
+      return subject as Subject;
+    },
+  };
 }

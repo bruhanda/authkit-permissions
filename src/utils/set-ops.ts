@@ -1,20 +1,32 @@
 /**
- * Internal Set helpers. Kept tiny so they tree-shake when unused.
+ * Stable union of two readonly arrays without mutating inputs.
+ *
+ * Preserves insertion order: elements from `a` first, then unique elements
+ * from `b`. Used when merging effective-permission rule lists from
+ * different roles in the role-graph closure.
+ *
+ * @example
+ *   union(['admin', 'member'], ['member', 'viewer']) // ['admin', 'member', 'viewer']
  */
-
-/** Union of two iterables, returning a fresh `Set`. */
-export const union = <T>(a: Iterable<T>, b: Iterable<T>): Set<T> => {
-  const out = new Set<T>(a);
-  for (const v of b) out.add(v);
-  return out;
-};
-
-/** Intersection of two iterables, returning a fresh `Set`. */
-export const intersection = <T>(a: Iterable<T>, b: Iterable<T>): Set<T> => {
-  const setB = b instanceof Set ? b : new Set<T>(b);
-  const out = new Set<T>();
-  for (const v of a) {
-    if (setB.has(v)) out.add(v);
+export function union<T>(a: ReadonlyArray<T>, b: ReadonlyArray<T>): T[] {
+  const seen = new Set<T>(a);
+  const out: T[] = [...a];
+  for (const v of b) {
+    if (!seen.has(v)) {
+      seen.add(v);
+      out.push(v);
+    }
   }
   return out;
-};
+}
+
+/**
+ * Intersection of two readonly arrays preserving the order of `b`.
+ *
+ * @example
+ *   intersect(['a', 'b', 'c'], ['c', 'b']) // ['c', 'b']
+ */
+export function intersect<T>(a: ReadonlyArray<T>, b: ReadonlyArray<T>): T[] {
+  const set = new Set<T>(a);
+  return b.filter((v) => set.has(v));
+}

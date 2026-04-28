@@ -1,101 +1,67 @@
-import type { Ability } from '../../core/ability.js';
-import { PermissionError } from '../../errors/permission-error.js';
-import type { Permissions } from '../../core/permissions.js';
-import type { AbilityCheckArgs } from '../../types/check-args.js';
-import type {
-  DefaultInstances,
-  InferActions,
-  InferResources,
-  InferRoles,
-  ResourceInstanceMap,
-} from '../../types/inference.js';
-import type { PolicyDefinition } from '../../types/policy.js';
+import type { Enforcer } from '../../core/enforcer.js';
+import type { CheckArgs } from '../../types/context.js';
+import type { InferActions, InferResources, InferRoles } from '../../types/inference.js';
+import type { PolicySpec } from '../../types/policy.js';
 import type { Subject } from '../../types/subject.js';
 
-/** Minimal Fastify-like app surface. */
-export interface FastifyLikeApp {
-  decorateRequest(name: string, defaultValue: unknown): void;
-  addHook(name: 'preHandler', fn: FastifyHook): void;
-  setErrorHandler(fn: (err: unknown, req: FastifyLikeRequest, reply: FastifyLikeReply) => unknown): void;
+/** Minimal Fastify request surface. */
+export interface FastifyRequestLike {
+  readonly user?: unknown;
+  readonly [key: string]: unknown;
 }
 
-export interface FastifyLikeRequest {
-  [k: string]: unknown;
+/** Minimal Fastify reply surface (unused on allow). */
+export interface FastifyReplyLike {
+  code(statusCode: number): FastifyReplyLike;
+  send(payload: unknown): FastifyReplyLike;
 }
 
-export interface FastifyLikeReply {
-  status(code: number): FastifyLikeReply;
-  send(body: unknown): unknown;
-}
+/** Fastify `preHandler` hook signature. */
+export type FastifyPreHandler = (
+  request: FastifyRequestLike,
+  reply: FastifyReplyLike,
+) => Promise<void> | void;
 
-export type FastifyHook = (req: FastifyLikeRequest, reply: FastifyLikeReply) => Promise<void> | void;
-
-export interface FastifyPermissionsConfig<
-  TPolicy extends PolicyDefinition,
-  TInstances extends ResourceInstanceMap<TPolicy> = DefaultInstances<TPolicy>,
+/** Configuration for the `fastifyPermissions` factory. */
+export interface FastifyPermissionsOptions<
+  P extends PolicySpec,
+  R extends InferResources<P>,
+  A extends InferActions<P, R>,
 > {
-  readonly permissions: Permissions<TPolicy, TInstances>;
+  readonly enforcer: Enforcer<P>;
   readonly getSubject: (
-    req: FastifyLikeRequest,
-  ) => Subject<InferRoles<TPolicy>> | null | Promise<Subject<InferRoles<TPolicy>> | null>;
+    request: FastifyRequestLike,
+  ) => Subject<InferRoles<P>> | Promise<Subject<InferRoles<P>>>;
+  readonly require: (
+    request: FastifyRequestLike,
+  ) => Omit<CheckArgs<P, R, A>, 'subject'> | Promise<Omit<CheckArgs<P, R, A>, 'subject'>>;
 }
 
 /**
- * Register the permissions plugin on a Fastify-like app. Decorates every
- * request with `subject` / `ability` / `enforce` and installs an error
- * handler that converts `PermissionError` into a 403 JSON response.
+ * Build a Fastify `preHandler` that enforces a permission requirement.
  *
- * @param app A Fastify (or compatible) instance.
- * @param config Adapter config — `permissions`, `getSubject`.
- *
- * @returns `void`.
- *
- * @throws Never throws.
+ * `enforcer.enforce` throws `PermissionError(FORBIDDEN)` on deny; Fastify's
+ * error hook converts the error to the configured error response.
  *
  * @example
- * ```ts
- * import Fastify from 'fastify';
- * import { fastifyPermissions } from '@authkit/permissions/adapters/fastify';
- *
- * const app = Fastify();
- * fastifyPermissions(app, { permissions, getSubject: (req) => req.user ?? null });
- * app.delete('/posts/:id', async (req) => {
- *   (req as any).enforce({ action: 'delete', resource: 'post' });
- *   return { ok: true };
- * });
- * ```
+ *   app.delete('/posts/:id',
+ *     { preHandler: fastifyPermissions({
+ *         enforcer,
+ *         getSubject: (req) => req.user as Subject,
+ *         require: (req) => ({ resource: 'post', action: 'delete' }),
+ *       }) },
+ *     postsController.delete,
+ *   );
  */
 export function fastifyPermissions<
-  TPolicy extends PolicyDefinition,
-  TInstances extends ResourceInstanceMap<TPolicy> = DefaultInstances<TPolicy>,
->(app: FastifyLikeApp, config: FastifyPermissionsConfig<TPolicy, TInstances>): void {
-  app.decorateRequest('subject', null);
-  app.decorateRequest('ability', null);
-  app.decorateRequest('enforce', null);
-
-  app.addHook('preHandler', async (req, reply) => {
-    const subject = await config.getSubject(req);
-    if (!subject) {
-      reply.status(401).send({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
-      return;
-    }
-    const ability: Ability<TPolicy, TInstances> = config.permissions.abilityFor(subject);
-    req['subject'] = subject;
-    req['ability'] = ability;
-    req['enforce'] = <
-      R extends InferResources<TPolicy>,
-      A extends InferActions<TPolicy, R>,
-    >(args: AbilityCheckArgs<TPolicy, R, A, TInstances>): void => {
-      ability.enforce(args);
-    };
-  });
-
-  app.setErrorHandler((err, _req, reply) => {
-    if (err instanceof PermissionError) {
-      const r = err.toResponse();
-      reply.status(r.status).send(r.body);
-      return;
-    }
-    throw err;
-  });
+  P extends PolicySpec,
+  R extends InferResources<P>,
+  A extends InferActions<P, R>,
+>(options: FastifyPermissionsOptions<P, R, A>): FastifyPreHandler {
+  const { enforcer, getSubject, require: requirementFor } = options;
+  return async (request, _reply) => {
+    const subject = await getSubject(request);
+    const requirement = await requirementFor(request);
+    await enforcer.enforce({ subject, ...requirement } as CheckArgs<P, R, A>);
+  };
 }

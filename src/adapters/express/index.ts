@@ -1,160 +1,81 @@
-import type { Ability } from '../../core/ability.js';
-import { PermissionError } from '../../errors/permission-error.js';
-import type { Permissions } from '../../core/permissions.js';
-import type { AbilityCheckArgs } from '../../types/check-args.js';
-import type {
-  DefaultInstances,
-  InferActions,
-  InferResources,
-  InferRoles,
-  ResourceInstanceMap,
-} from '../../types/inference.js';
-import type { PolicyDefinition } from '../../types/policy.js';
+import { PermissionError } from '../../errors/base.js';
+import { ERROR_CODES } from '../../errors/codes.js';
+import type { Enforcer } from '../../core/enforcer.js';
+import type { CheckArgs } from '../../types/context.js';
+import type { InferActions, InferResources, InferRoles } from '../../types/inference.js';
+import type { PolicySpec } from '../../types/policy.js';
 import type { Subject } from '../../types/subject.js';
 
 /** Minimal Express request shape. */
 export interface ExpressRequestLike {
-  [k: string]: unknown;
+  readonly user?: unknown;
+  readonly [key: string]: unknown;
 }
 
-/** Minimal Express response shape. */
+/** Minimal Express response shape — only what we touch on deny. */
 export interface ExpressResponseLike {
   status(code: number): ExpressResponseLike;
-  json(body: unknown): unknown;
+  json(body: unknown): ExpressResponseLike;
 }
 
-export type ExpressNext = (err?: unknown) => void;
-
-export interface ExpressPermissionsConfig<
-  TPolicy extends PolicyDefinition,
-  TInstances extends ResourceInstanceMap<TPolicy> = DefaultInstances<TPolicy>,
-> {
-  readonly permissions: Permissions<TPolicy, TInstances>;
-  /** Returns `null` to respond with `401`. */
-  readonly getSubject: (req: ExpressRequestLike) => Subject<InferRoles<TPolicy>> | null | Promise<Subject<InferRoles<TPolicy>> | null>;
-}
-
-/**
- * Build an Express middleware that attaches a bound `Ability` to
- * `req.ability` and a sugar function `req.enforce` for use in handlers.
- *
- * @param config Adapter config — `permissions`, `getSubject`.
- *
- * @returns An Express middleware.
- *
- * @throws The middleware itself never throws; calling `req.enforce(...)`
- *         throws `PermissionError` on denial — the included error handler
- *         translates that to a 403 JSON response.
- *
- * @example
- * ```ts
- * import express from 'express';
- * import { expressPermissions, expressErrorHandler } from '@authkit/permissions/adapters/express';
- *
- * const app = express();
- * app.use(expressPermissions({ permissions, getSubject: (req) => req.user ?? null }));
- * app.delete('/posts/:id', (req, res) => {
- *   (req as any).enforce({ action: 'delete', resource: 'post' });
- *   res.json({ ok: true });
- * });
- * app.use(expressErrorHandler());
- * ```
- */
-export function expressPermissions<
-  TPolicy extends PolicyDefinition,
-  TInstances extends ResourceInstanceMap<TPolicy> = DefaultInstances<TPolicy>,
->(
-  config: ExpressPermissionsConfig<TPolicy, TInstances>,
-): (
+/** Express `RequestHandler` shape (without the full body). */
+export type ExpressMiddleware = (
   req: ExpressRequestLike,
   res: ExpressResponseLike,
-  next: ExpressNext,
-) => void {
-  return (req, res, next): void => {
-    Promise.resolve(config.getSubject(req))
-      .then((subject) => {
-        if (!subject) {
-          res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
-          return;
-        }
-        const ability: Ability<TPolicy, TInstances> = config.permissions.abilityFor(subject);
-        req['subject'] = subject;
-        req['ability'] = ability;
-        req['enforce'] = <
-          R extends InferResources<TPolicy>,
-          A extends InferActions<TPolicy, R>,
-        >(args: AbilityCheckArgs<TPolicy, R, A, TInstances>): void => {
-          ability.enforce(args);
-        };
-        next();
-      })
-      .catch(next);
-  };
+  next: (err?: unknown) => void,
+) => void | Promise<void>;
+
+/** Configuration for the `expressPermissions` middleware factory. */
+export interface ExpressPermissionsOptions<
+  P extends PolicySpec,
+  R extends InferResources<P>,
+  A extends InferActions<P, R>,
+> {
+  /** Pull a `Subject` out of the request (set by upstream auth middleware). */
+  readonly getSubject: (
+    req: ExpressRequestLike,
+  ) => Subject<InferRoles<P>> | Promise<Subject<InferRoles<P>>>;
+  /** Build the resource/action/data triple for this route. */
+  readonly require: (
+    req: ExpressRequestLike,
+  ) => Omit<CheckArgs<P, R, A>, 'subject'> | Promise<Omit<CheckArgs<P, R, A>, 'subject'>>;
+  /**
+   * If `false` (default), `PermissionError(FORBIDDEN)` is forwarded to
+   * `next(err)` so the application's error handler decides the response.
+   * If `true`, the middleware writes a 403 JSON response itself.
+   */
+  readonly handle403?: boolean;
 }
 
 /**
- * Build a per-route Express handler that enforces one permission before
- * delegating to the underlying handler.
- *
- * @param requirement The `{ resource, action }` to enforce.
- *
- * @returns An Express middleware that 403s on denial.
- *
- * @throws Never throws — denials are translated to a JSON response.
+ * Build an Express middleware that enforces a permission requirement.
  *
  * @example
- * ```ts
- * app.delete('/posts/:id',
- *   requirePermission({ resource: 'post', action: 'delete' }),
- *   handler,
- * );
- * ```
+ *   app.delete('/posts/:id',
+ *     expressPermissions(enforcer, {
+ *       getSubject: (req) => req.user as Subject,
+ *       require: (req) => ({ resource: 'post', action: 'delete', data: { id: req.params.id } }),
+ *     }),
+ *     postsController.delete,
+ *   );
  */
-export function requirePermission<
-  TPolicy extends PolicyDefinition,
-  R extends InferResources<TPolicy>,
-  A extends InferActions<TPolicy, R>,
->(
-  requirement: { resource: R; action: A },
-): (req: ExpressRequestLike, res: ExpressResponseLike, next: ExpressNext) => void {
-  return (req, res, next): void => {
-    const ability = req['ability'] as Ability<TPolicy> | undefined;
-    if (!ability) {
-      res.status(401).json({ error: 'Unauthorized', code: 'UNAUTHORIZED' });
-      return;
-    }
+export function expressPermissions<
+  P extends PolicySpec,
+  R extends InferResources<P>,
+  A extends InferActions<P, R>,
+>(enforcer: Enforcer<P>, options: ExpressPermissionsOptions<P, R, A>): ExpressMiddleware {
+  return async (req, res, next) => {
     try {
-      ability.enforce(requirement as never);
+      const subject = await options.getSubject(req);
+      const requirement = await options.require(req);
+      await enforcer.enforce({ subject, ...requirement } as CheckArgs<P, R, A>);
       next();
     } catch (err) {
-      if (err instanceof PermissionError) {
-        const r = err.toResponse();
-        res.status(r.status).json(r.body);
+      if (options.handle403 === true && err instanceof PermissionError && err.code === ERROR_CODES.FORBIDDEN) {
+        res.status(403).json({ error: 'Forbidden', code: err.code });
         return;
       }
       next(err);
     }
-  };
-}
-
-/**
- * Standard error handler that converts `PermissionError` into a 403 JSON
- * response. Mount AFTER your routes.
- *
- * @returns An Express error-handling middleware.
- */
-export function expressErrorHandler(): (
-  err: unknown,
-  _req: ExpressRequestLike,
-  res: ExpressResponseLike,
-  next: ExpressNext,
-) => void {
-  return (err, _req, res, next): void => {
-    if (err instanceof PermissionError) {
-      const r = err.toResponse();
-      res.status(r.status).json(r.body);
-      return;
-    }
-    next(err);
   };
 }

@@ -1,44 +1,58 @@
 import type { Subject } from './subject.js';
-import type { ResourceInstance } from './instances.js';
 
 /**
- * A condition function evaluated as part of a permission rule.
+ * Arguments passed to a condition function.
  *
- * Returning `true` means the rule applies; returning `false` (or rejecting)
- * means the rule does not match and evaluation falls through to the next
- * candidate rule.
+ * Conditions are pure boolean predicates that consider the subject, the
+ * resource instance (when supplied), and the action. They never mutate
+ * shared state and never perform I/O on the hot path (use a sync condition
+ * with pre-loaded data, or an async one with cache).
  */
-export type ConditionFn<
-  TSubject extends Subject = Subject,
-  TTarget = ResourceInstance,
-  TCtx extends Record<string, unknown> = Record<string, unknown>,
-> = (
-  args: ConditionArgs<TSubject, TTarget, TCtx>,
-) => boolean | Promise<boolean>;
-
-/**
- * Arguments passed to a `ConditionFn`. The `target` is typed per-resource
- * when the consumer supplies `TInstances` to `definePolicy`.
- */
-export interface ConditionArgs<
-  TSubject extends Subject = Subject,
-  TTarget = ResourceInstance,
-  TCtx extends Record<string, unknown> = Record<string, unknown>,
-> {
-  readonly subject: TSubject;
-  readonly target?: TTarget;
-  readonly context: Readonly<TCtx>;
+export interface ConditionArgs<TData = Record<string, unknown> | undefined> {
+  /** Caller. */
+  readonly subject: Subject;
+  /**
+   * Resource instance, when supplied at the call site. May be `undefined`
+   * for permission probes that don't have an instance to test against.
+   */
+  readonly resource?: TData;
+  /** String literal of the resource type, narrowed via `ResourceDataMap`. */
+  readonly resourceType: string;
+  /** Action name from the policy, narrowed by the resource. */
+  readonly action: string;
+  /** Effective tenant scope of the check (subject's tenant or override). */
   readonly tenantId?: string;
-  /** Stable monotonic clock for deterministic time-based rules in tests. */
-  readonly now: () => Date;
 }
 
+/** Tagged sync condition — runs on `enforcer.checkSync` fast-path. */
+export interface TaggedSyncCondition<TArgs = ConditionArgs> {
+  (args: TArgs): boolean;
+  readonly __authkitMode: 'sync';
+}
+
+/** Tagged async condition — `checkSync` throws `ASYNC_CONDITION_IN_SYNC_PATH`. */
+export interface TaggedAsyncCondition<TArgs = ConditionArgs> {
+  (args: TArgs): Promise<boolean>;
+  readonly __authkitMode: 'async';
+}
+
+/** Plain sync predicate signature (no tag). */
+export type ConditionFn<TArgs = ConditionArgs> = (args: TArgs) => boolean;
+
+/** Plain async predicate signature (no tag). */
+export type AsyncConditionFn<TArgs = ConditionArgs> = (
+  args: TArgs,
+) => Promise<boolean>;
+
 /**
- * A declarative condition shape. Recognised by `accessibleBy()` so it can
- * lower the predicate to a SQL/Mongo `where` instead of treating it as an
- * opaque function. Use the `eq` / `inList` helpers from `@authkit/permissions`
- * to build these — building one by hand is supported but verbose.
+ * Accepted condition entry shape inside a `PolicySpec`.
+ *
+ * Tagged sync / async functions get the matching dispatch path. **Untagged**
+ * arrows are accepted for terse policy literals but treated as **async** at
+ * runtime — the cost of a spurious async path is one Promise allocation,
+ * while the cost of a spurious sync path is a silent-allow security bug.
  */
-export type DeclarativeCondition =
-  | { readonly kind: 'declarative-eq'; readonly field: string; readonly value: unknown | ((s: Subject) => unknown) }
-  | { readonly kind: 'declarative-in'; readonly field: string; readonly values: readonly unknown[] | ((s: Subject) => readonly unknown[]) };
+export type ConditionEntry =
+  | TaggedSyncCondition
+  | TaggedAsyncCondition
+  | ((args: ConditionArgs) => boolean | Promise<boolean>);

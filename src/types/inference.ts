@@ -1,29 +1,28 @@
-import type { PolicyDefinition } from './policy.js';
-import type { ResourceInstance } from './instances.js';
+import type { ConditionEntry } from './condition.js';
+import type { PolicySpec, ResourceDef } from './policy.js';
 
-/** All role names declared in a policy literal. */
-export type InferRoles<P extends PolicyDefinition> = keyof P['roles'] & string;
+/** Union of every role name declared in `P`. */
+export type InferRoles<P extends PolicySpec> = keyof P['roles'] & string;
 
-/** All resource names declared in a policy literal. */
-export type InferResources<P extends PolicyDefinition> = keyof P['resources'] & string;
+/** Union of every resource name declared in `P`. */
+export type InferResources<P extends PolicySpec> = keyof P['resources'] & string;
 
-/** Actions declared on a specific resource. */
+/** Union of every action declared for resource `R` in `P`. */
 export type InferActions<
-  P extends PolicyDefinition,
+  P extends PolicySpec,
   R extends InferResources<P>,
-> = P['resources'][R] extends { actions: readonly (infer A)[] } ? A & string : never;
+> = P['resources'][R] extends ResourceDef<infer A> ? A : never;
 
-/** Reverse map: `{ post: 'read'|'create'|...; comment: 'read'|... }`. */
-export type ActionsByResource<P extends PolicyDefinition> = {
-  [R in InferResources<P>]: InferActions<P, R>;
-};
+/** Union of every condition name declared in `P`. */
+export type InferConditions<P extends PolicySpec> = NonNullable<P['conditions']> extends infer C
+  ? C extends Record<string, ConditionEntry>
+    ? keyof C & string
+    : never
+  : never;
 
-/** Per-resource concrete instance shapes (for typed `target`). */
-export type ResourceInstanceMap<P extends PolicyDefinition> = {
-  [R in InferResources<P>]: ResourceInstance;
-};
-
-/** Default permissive instance map used when the consumer doesn't supply one. */
-export type DefaultInstances<P extends PolicyDefinition> = {
-  [R in InferResources<P>]: ResourceInstance;
-};
+/** Map of condition-name → typed function (sync or async). */
+export type InferConditionMap<P extends PolicySpec> = NonNullable<P['conditions']> extends infer C
+  ? C extends Record<string, ConditionEntry>
+    ? { readonly [K in keyof C]: C[K] }
+    : Record<string, never>
+  : Record<string, never>;
