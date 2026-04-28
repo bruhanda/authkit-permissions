@@ -1,0 +1,15 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "./.tsout",
+    "noEmit": true,
+    "types": ["node"],
+    "verbatimModuleSyntax": false,
+    "exactOptionalPropertyTypes": false,
+    "moduleResolution": "Bundler",
+    "module": "ESNext"
+  },
+  "include": ["./**/*.ts"],
+  "exclude": ["./sandbox", "./.tsout"]
+}

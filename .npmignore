@@ -1,0 +1,85 @@
+# Source — published `dist/` output is enough; users wanting to read source
+# can browse the GitHub repo. Keeping `src/` out trims the tarball noticeably.
+src/
+__tests__/
+*.test.ts
+*.test.tsx
+*.test-d.ts
+*.bench.ts
+
+# Test, coverage and benchmark artefacts
+coverage/
+.nyc_output/
+.vitest-cache/
+vitest.config.ts
+vitest.config.*.ts
+
+# Build tooling configuration (not needed by consumers)
+tsconfig.json
+tsconfig.build.json
+tsup.config.ts
+biome.json
+.size-limit
+size-limit.config.*
+
+# Examples / sandbox / playground
+examples/
+sandbox/
+playground/
+demo/
+fixtures/
+benchmarks/
+
+# Project / planning docs (README, CHANGELOG, LICENSE are still published
+# because `package.json` `files` whitelists them and they are not listed here)
+PLAN.md
+REVIEW.md
+ARCHITECTURE.md
+NOTES.md
+TODO.md
+
+# CI / repo metadata
+.github/
+.changeset/
+.gitignore
+.gitattributes
+.editorconfig
+.npmrc
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Logs and debug output
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Env / secrets — must never end up in a tarball
+.env
+.env.*
+*.pem
+
+# VCS / lockfiles (npm publishes its own metadata; lockfiles are not used
+# by downstream consumers)
+.git/
+.gitmodules
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Framework / bundler caches
+.cache/
+.turbo/
+.next/
+.nuxt/
+.svelte-kit/
+.wrangler/
+.vercel/
+*.tsbuildinfo
