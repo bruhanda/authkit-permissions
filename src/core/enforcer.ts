@@ -5,7 +5,7 @@ import type {
   AuditHook,
   AuditReason,
 } from '../types/audit.js';
-import type { ConditionArgs, ConditionEntry } from '../types/condition.js';
+import type { ConditionArgs } from '../types/condition.js';
 import type { CheckArgs } from '../types/context.js';
 import type {
   EffectivePermissions,
@@ -18,7 +18,7 @@ import type {
   InferResources,
   InferRoles,
 } from '../types/inference.js';
-import type { Policy, PolicySpec, RuleDef } from '../types/policy.js';
+import type { Policy, PolicySpec } from '../types/policy.js';
 import type { Decision } from '../types/result.js';
 import type { Subject } from '../types/subject.js';
 import { isDev } from '../utils/env.js';
@@ -38,6 +38,15 @@ import {
 import { actionMatches } from './matcher.js';
 import { LRU } from './memo.js';
 import { buildRoleClosure } from './role-graph.js';
+
+/**
+ * Memoised public view of an `EffectiveTable`. Keyed by the frozen table
+ * itself, so each per-role-set table builds its `EffectivePermissions<P>`
+ * object exactly once across the lifetime of the enforcer's LRU entry —
+ * `permissionsOf` callers see stable identity (downstream memoisation
+ * friendly) and we stay off the alloc-heavy hot path.
+ */
+const effectivePermissionsCache = new WeakMap<object, Readonly<unknown>>();
 
 /**
  * Runtime configuration for an enforcer instance.
@@ -157,6 +166,25 @@ export interface Enforcer<P extends PolicySpec> {
     readonly resource: R;
     readonly action: A;
   }): FilterAst;
+
+  /**
+   * Return a request-bound view of this enforcer that forwards audit
+   * promises to the given `waitUntil` (Workers / Hono `executionCtx`).
+   *
+   * The returned enforcer shares the underlying LRU, role-graph closure,
+   * and policy reference — only the audit-promise sink is overridden, so
+   * this is cheap to call per request. Concurrent requests cannot race
+   * because each view captures its own `waitUntil` in a fresh closure
+   * (no mutable shared global, see plan §9.4.2).
+   *
+   * @param waitUntil - per-request promise sink, or `undefined` to fall
+   *   back to whatever was supplied at `createEnforcer` time.
+   *
+   * @example
+   *   const requestEnforcer = enforcer.withWaitUntil(c.executionCtx?.waitUntil);
+   *   await requestEnforcer.enforce({ subject, resource: 'document', action: 'read' });
+   */
+  withWaitUntil(waitUntil: ((p: Promise<unknown>) => void) | undefined): Enforcer<P>;
 
   /** The frozen policy this enforcer was created from. */
   readonly policy: Policy<P>;
@@ -289,13 +317,17 @@ export function createEnforcer<P extends PolicySpec>(
     return event as AuditEvent;
   };
 
-  const emitAudit = async (event: AuditEvent): Promise<{ overrideDeny: boolean }> => {
+  const emitAudit = async (
+    event: AuditEvent,
+    waitUntilOverride?: (p: Promise<unknown>) => void,
+  ): Promise<{ overrideDeny: boolean }> => {
     if (audit === undefined) return { overrideDeny: false };
+    const wu = waitUntilOverride ?? waitUntil;
     try {
       const result = audit(event);
       if (result instanceof Promise) {
-        if (waitUntil !== undefined) {
-          waitUntil(result);
+        if (wu !== undefined) {
+          wu(result);
         } else {
           await result;
         }
@@ -317,7 +349,7 @@ export function createEnforcer<P extends PolicySpec>(
         try {
           const next = audit(synthetic);
           if (next instanceof Promise) {
-            if (waitUntil !== undefined) waitUntil(next);
+            if (wu !== undefined) wu(next);
             else await next.catch(() => undefined);
           }
         } catch {
@@ -430,7 +462,10 @@ export function createEnforcer<P extends PolicySpec>(
       };
     }
     for (const role of subject.roles) {
-      if (!(role in policy.spec.roles)) {
+      // `Object.hasOwn` keeps a forged `Subject` whose `roles` includes
+      // `'toString'` / `'__proto__'` from sneaking past the unknown-role
+      // audit reason — `'toString' in {}` returns `true`.
+      if (!Object.hasOwn(policy.spec.roles, role)) {
         return {
           ok: false,
           outcome: { decision: 'deny', reason: 'unknown_role_on_subject' },
@@ -546,32 +581,63 @@ export function createEnforcer<P extends PolicySpec>(
     };
   };
 
-  const enforcer: Enforcer<P> = {
-    policy,
+  const permissionsOf = (
+    roles: ReadonlyArray<InferRoles<P>>,
+  ): Readonly<EffectivePermissions<P>> => {
+    const table = tableFor(roles);
+    // Plan §2.2 / Review 2 #17: no defensive deep-clone. The compiled
+    // entries are produced and stored once per role-set in the LRU and
+    // their structural shape is the public `CompiledRule<P>` modulo
+    // string-literal precision — a direct cast is sound. Cache the
+    // resource-keyed object beside the table so callers see stable
+    // identity (downstream memoisation) and we stop allocating fresh
+    // objects on every inspection call.
+    const cached = effectivePermissionsCache.get(table);
+    if (cached !== undefined) return cached as Readonly<EffectivePermissions<P>>;
+    const out: Record<string, Record<string, ReadonlyArray<PublicCompiledRule<P>>>> = {};
+    for (const [resource, bucket] of table) {
+      const inner: Record<string, ReadonlyArray<PublicCompiledRule<P>>> = {};
+      for (const [action, entries] of bucket) {
+        inner[action] = entries as unknown as ReadonlyArray<PublicCompiledRule<P>>;
+      }
+      out[resource] = inner;
+    }
+    const frozen = Object.freeze(out) as Readonly<EffectivePermissions<P>>;
+    effectivePermissionsCache.set(table, frozen);
+    return frozen;
+  };
 
-    async check<R extends InferResources<P>, A extends InferActions<P, R>>(
-      args: CheckArgs<P, R, A>,
-    ): Promise<boolean> {
-      const { outcome, effectiveTenant, crossTenant } = await dispatchAsync(args);
-      const event = buildAuditEvent(
-        args as CheckArgs<P, never, never>,
-        outcome.decision,
-        outcome.reason,
-        effectiveTenant,
-        crossTenant,
-        outcome,
-      );
-      const { overrideDeny } = await emitAudit(event);
-      if (overrideDeny) return false;
-      return outcome.decision === 'allow';
-    },
+  const accessibleByImpl = <R extends InferResources<P>, A extends InferActions<P, R>>(args: {
+    readonly subject: Subject<InferRoles<P>>;
+    readonly resource: R;
+    readonly action: A;
+  }): FilterAst =>
+    computeAccessibleFilter(
+      policy.spec,
+      closure,
+      conditions,
+      tableFor(args.subject.roles),
+      args,
+    );
 
-    checkSync<R extends InferResources<P>, A extends InferActions<P, R>>(
-      args: CheckArgs<P, R, A>,
-    ): boolean {
-      const { outcome, effectiveTenant, crossTenant } = dispatchSync(args);
-      // Sync path: fire audit but never await — log mode only.
-      if (audit !== undefined) {
+  // Build the public Enforcer view bound to a per-request `waitUntil`.
+  // Sharing `permissionsOf` / `accessibleByImpl` / `policy` across views keeps
+  // the LRU and compiled-table identity stable; `check` / `checkSync` /
+  // `explain` close over the per-view `viewWaitUntil` so two concurrent
+  // requests cannot race on a mutable global (the reason a
+  // `currentWaitUntil` mutable was rejected — plan §9.4.2).
+  const buildView = (
+    viewWaitUntil: ((p: Promise<unknown>) => void) | undefined,
+  ): Enforcer<P> => {
+    const view: Enforcer<P> = {
+      policy,
+      permissionsOf,
+      accessibleBy: accessibleByImpl,
+
+      async check<R extends InferResources<P>, A extends InferActions<P, R>>(
+        args: CheckArgs<P, R, A>,
+      ): Promise<boolean> {
+        const { outcome, effectiveTenant, crossTenant } = await dispatchAsync(args);
         const event = buildAuditEvent(
           args as CheckArgs<P, never, never>,
           outcome.decision,
@@ -580,119 +646,117 @@ export function createEnforcer<P extends PolicySpec>(
           crossTenant,
           outcome,
         );
-        try {
-          const result = audit(event);
-          if (result instanceof Promise) {
-            if (waitUntil !== undefined) waitUntil(result);
-            else result.catch((err) => {
-              if (isDev()) {
-                // eslint-disable-next-line no-console
-                console.error('[authkit/permissions] audit hook rejected (sync path)', err);
-              }
-            });
+        const { overrideDeny } = await emitAudit(event, viewWaitUntil);
+        if (overrideDeny) return false;
+        return outcome.decision === 'allow';
+      },
+
+      checkSync<R extends InferResources<P>, A extends InferActions<P, R>>(
+        args: CheckArgs<P, R, A>,
+      ): boolean {
+        const { outcome, effectiveTenant, crossTenant } = dispatchSync(args);
+        // Sync path: fire audit but never await — log mode only.
+        if (audit !== undefined) {
+          const event = buildAuditEvent(
+            args as CheckArgs<P, never, never>,
+            outcome.decision,
+            outcome.reason,
+            effectiveTenant,
+            crossTenant,
+            outcome,
+          );
+          const wu = viewWaitUntil ?? waitUntil;
+          try {
+            const result = audit(event);
+            if (result instanceof Promise) {
+              if (wu !== undefined) wu(result);
+              else
+                result.catch((err) => {
+                  if (isDev()) {
+                    // eslint-disable-next-line no-console
+                    console.error('[authkit/permissions] audit hook rejected (sync path)', err);
+                  }
+                });
+            }
+          } catch (err) {
+            if (auditFailureMode === 'throw') throw err;
+            if (auditFailureMode === 'deny') return false;
+            // eslint-disable-next-line no-console
+            console.error('[authkit/permissions] audit hook threw (sync path)', err);
           }
-        } catch (err) {
-          if (auditFailureMode === 'throw') throw err;
-          if (auditFailureMode === 'deny') return false;
-          // eslint-disable-next-line no-console
-          console.error('[authkit/permissions] audit hook threw (sync path)', err);
         }
-      }
-      return outcome.decision === 'allow';
-    },
+        return outcome.decision === 'allow';
+      },
 
-    async enforce<R extends InferResources<P>, A extends InferActions<P, R>>(
-      args: CheckArgs<P, R, A>,
-    ): Promise<void> {
-      const allowed = await enforcer.check(args);
-      if (!allowed) {
-        throw new PermissionError(
-          ERROR_CODES.FORBIDDEN,
-          `Forbidden: ${String(args.action)} on ${String(args.resource)}`,
-          {
-            subjectId: args.subject.id,
-            action: args.action as string,
-            resource: args.resource as string,
-          },
+      async enforce<R extends InferResources<P>, A extends InferActions<P, R>>(
+        args: CheckArgs<P, R, A>,
+      ): Promise<void> {
+        const allowed = await view.check(args);
+        if (!allowed) {
+          throw new PermissionError(
+            ERROR_CODES.FORBIDDEN,
+            `Forbidden: ${String(args.action)} on ${String(args.resource)}`,
+            {
+              subjectId: args.subject.id,
+              action: args.action as string,
+              resource: args.resource as string,
+            },
+          );
+        }
+      },
+
+      async explain<R extends InferResources<P>, A extends InferActions<P, R>>(
+        args: CheckArgs<P, R, A>,
+      ): Promise<Decision<P, R, A>> {
+        const start = nowMs();
+        const { outcome, effectiveTenant, crossTenant } = await dispatchAsync(args);
+        const durationMs = nowMs() - start;
+        const event = buildAuditEvent(
+          args as CheckArgs<P, never, never>,
+          outcome.decision,
+          outcome.reason,
+          effectiveTenant,
+          crossTenant,
+          { ...outcome, durationMs },
         );
-      }
-    },
+        await emitAudit(event, viewWaitUntil);
+        const decision: {
+          allowed: boolean;
+          reason: AuditReason;
+          resource: R;
+          action: A;
+          grantedBy?: string;
+          conditionName?: string;
+          durationMs?: number;
+        } = {
+          allowed: outcome.decision === 'allow',
+          reason: outcome.reason,
+          resource: args.resource,
+          action: args.action,
+          durationMs,
+        };
+        if (outcome.grantedBy !== undefined) decision.grantedBy = outcome.grantedBy;
+        if (outcome.conditionName !== undefined) decision.conditionName = outcome.conditionName;
+        return decision as Decision<P, R, A>;
+      },
 
-    async explain<R extends InferResources<P>, A extends InferActions<P, R>>(
-      args: CheckArgs<P, R, A>,
-    ): Promise<Decision<P, R, A>> {
-      const start = nowMs();
-      const { outcome, effectiveTenant, crossTenant } = await dispatchAsync(args);
-      const durationMs = nowMs() - start;
-      const event = buildAuditEvent(
-        args as CheckArgs<P, never, never>,
-        outcome.decision,
-        outcome.reason,
-        effectiveTenant,
-        crossTenant,
-        { ...outcome, durationMs },
-      );
-      await emitAudit(event);
-      const decision: {
-        allowed: boolean;
-        reason: AuditReason;
-        resource: R;
-        action: A;
-        grantedBy?: string;
-        conditionName?: string;
-        durationMs?: number;
-      } = {
-        allowed: outcome.decision === 'allow',
-        reason: outcome.reason,
-        resource: args.resource,
-        action: args.action,
-        durationMs,
-      };
-      if (outcome.grantedBy !== undefined) decision.grantedBy = outcome.grantedBy;
-      if (outcome.conditionName !== undefined) decision.conditionName = outcome.conditionName;
-      return decision as Decision<P, R, A>;
-    },
-
-    permissionsOf(roles: ReadonlyArray<InferRoles<P>>): Readonly<EffectivePermissions<P>> {
-      const table = tableFor(roles);
-      const out: Record<string, Record<string, ReadonlyArray<PublicCompiledRule<P>>>> = {};
-      for (const [resource, bucket] of table) {
-        const inner: Record<string, ReadonlyArray<PublicCompiledRule<P>>> = {};
-        for (const [action, entries] of bucket) {
-          inner[action] = entries.map((entry) => ({
-            resource: entry.resource as InferResources<P>,
-            action: entry.action,
-            rule: entry.rule as RuleDef,
-            priority: entry.priority,
-            order: entry.order,
-            grantedBy: entry.grantedBy as InferRoles<P>,
-          })) as ReadonlyArray<PublicCompiledRule<P>>;
-        }
-        out[resource] = inner;
-      }
-      return out as Readonly<EffectivePermissions<P>>;
-    },
-
-    accessibleBy<R extends InferResources<P>, A extends InferActions<P, R>>(args: {
-      readonly subject: Subject<InferRoles<P>>;
-      readonly resource: R;
-      readonly action: A;
-    }): FilterAst {
-      return computeAccessibleFilter(
-        policy.spec,
-        closure,
-        conditions,
-        tableFor(args.subject.roles),
-        args,
-      );
-    },
+      withWaitUntil(wu: ((p: Promise<unknown>) => void) | undefined): Enforcer<P> {
+        return buildView(wu);
+      },
+    };
+    return view;
   };
 
-  return enforcer;
+  return buildView(waitUntil);
 }
 
 function sortedKey(roles: ReadonlyArray<string>): string {
-  return [...new Set(roles)].sort().join('');
+  // U+001F (Unit Separator) cannot legally appear in a role name, so the
+  // joined string is collision-free — `['ad', 'min']` and `['admin']`
+  // map to distinct cache keys. Joining with empty / single-char separators
+  // is the FNV-1a hazard plan §9.2.12 set out to eliminate. Written as the
+  // explicit Unicode escape so review tooling does not elide it.
+  return [...new Set(roles)].sort().join('\u001f');
 }
 
 function mergeState(target: RuleEvalState, source: RuleEvalState): void {

@@ -100,12 +100,29 @@ function walkSync(node: RuleDef | string, ctx: EvalContext, state: RuleEvalState
         anyPassed = true;
         break;
       }
+      mergeInnerState(state, inner);
     }
     return anyPassed;
   }
   // `not`
   const inner: RuleEvalState = {};
   const result = walkSync(node.not, ctx, inner);
+  // Mirror the async branch: if the inner condition threw, fail closed and
+  // surface the cause to the audit reason. Without this, `runOneSync` would
+  // catch the throw and return `false`, then `!false === true` would silently
+  // grant access — exactly the fail-closed-and-observable invariant plan
+  // §5.2 / §9.2.8 promised to uphold.
+  if (inner.threwCondition !== undefined) {
+    state.threwCondition = inner.threwCondition;
+    state.threwCause = inner.threwCause;
+    return false;
+  }
+  if (inner.nonBooleanCondition !== undefined && state.nonBooleanCondition === undefined) {
+    state.nonBooleanCondition = inner.nonBooleanCondition;
+  }
+  if (inner.failedCondition !== undefined) {
+    state.failedCondition = inner.failedCondition;
+  }
   return !result;
 }
 
@@ -129,9 +146,7 @@ async function walkAsync(
       const inner: RuleEvalState = {};
       const ok = await walkAsync(part, ctx, inner);
       if (ok) return true;
-      if (state.failedCondition === undefined && inner.failedCondition !== undefined) {
-        state.failedCondition = inner.failedCondition;
-      }
+      mergeInnerState(state, inner);
     }
     return false;
   }
@@ -143,7 +158,26 @@ async function walkAsync(
     state.threwCause = inner.threwCause;
     return false;
   }
+  if (inner.nonBooleanCondition !== undefined && state.nonBooleanCondition === undefined) {
+    state.nonBooleanCondition = inner.nonBooleanCondition;
+  }
+  if (inner.failedCondition !== undefined) {
+    state.failedCondition = inner.failedCondition;
+  }
   return !ok;
+}
+
+function mergeInnerState(target: RuleEvalState, source: RuleEvalState): void {
+  if (source.threwCondition !== undefined && target.threwCondition === undefined) {
+    target.threwCondition = source.threwCondition;
+    target.threwCause = source.threwCause;
+  }
+  if (source.nonBooleanCondition !== undefined && target.nonBooleanCondition === undefined) {
+    target.nonBooleanCondition = source.nonBooleanCondition;
+  }
+  if (source.failedCondition !== undefined) {
+    target.failedCondition = source.failedCondition;
+  }
 }
 
 function lookup(name: string, ctx: EvalContext): ConditionEntry {

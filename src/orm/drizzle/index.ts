@@ -14,16 +14,21 @@ export interface DrizzleRoleAdapterOptions {
   /**
    * Run the membership query for `(userId, tenantId)` and return the
    * matching rows as plain objects. Each row must expose the role under
-   * the `role` key. `crossTenant` is optional.
+   * the `role` key.
    */
   readonly query: (args: {
     readonly userId: string;
     readonly tenantId: string;
-  }) => Promise<ReadonlyArray<{ readonly role: string; readonly crossTenant?: boolean }>>;
+  }) => Promise<ReadonlyArray<{ readonly role: string }>>;
 }
 
 /**
  * Build a role-loader against a Drizzle-backed memberships table.
+ *
+ * Per plan §9.2.4 the cross-tenant gate is "role flag + per-call opt-in"
+ * — the adapter only resolves role names. A `memberships.cross_tenant`
+ * column is **not** part of the contract; declare `crossTenant: true` on
+ * the role in the policy and pass `allowCrossTenant: true` per call.
  *
  * @param options - the membership query closure.
  * @returns an object with `loadSubject({ userId, tenantId })`.
@@ -43,14 +48,7 @@ export function createDrizzleRoleAdapter(options: DrizzleRoleAdapterOptions): {
     async loadSubject({ userId, tenantId }) {
       const rows = await options.query({ userId, tenantId });
       const roles = rows.map((row) => row.role).filter((r): r is string => typeof r === 'string');
-      const crossTenant = rows.some((row) => row.crossTenant === true);
-      const subject: { id: string; tenantId: string; roles: string[]; crossTenant?: true } = {
-        id: userId,
-        tenantId,
-        roles,
-      };
-      if (crossTenant) subject.crossTenant = true;
-      return subject as Subject;
+      return { id: userId, tenantId, roles } satisfies Subject;
     },
   };
 }

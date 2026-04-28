@@ -1,5 +1,3 @@
-import { PermissionError } from '../../errors/base.js';
-import { ERROR_CODES } from '../../errors/codes.js';
 import type { Enforcer } from '../../core/enforcer.js';
 import type { CheckArgs } from '../../types/context.js';
 import type { InferActions, InferResources, InferRoles } from '../../types/inference.js';
@@ -12,7 +10,7 @@ export interface ExpressRequestLike {
   readonly [key: string]: unknown;
 }
 
-/** Minimal Express response shape — only what we touch on deny. */
+/** Minimal Express response shape (currently unused — kept for future extension). */
 export interface ExpressResponseLike {
   status(code: number): ExpressResponseLike;
   json(body: unknown): ExpressResponseLike;
@@ -39,16 +37,16 @@ export interface ExpressPermissionsOptions<
   readonly require: (
     req: ExpressRequestLike,
   ) => Omit<CheckArgs<P, R, A>, 'subject'> | Promise<Omit<CheckArgs<P, R, A>, 'subject'>>;
-  /**
-   * If `false` (default), `PermissionError(FORBIDDEN)` is forwarded to
-   * `next(err)` so the application's error handler decides the response.
-   * If `true`, the middleware writes a 403 JSON response itself.
-   */
-  readonly handle403?: boolean;
 }
 
 /**
  * Build an Express middleware that enforces a permission requirement.
+ *
+ * Always forwards `PermissionError(FORBIDDEN)` (and any other error) to
+ * `next(err)` — the application's error handler decides the response. This
+ * matches the contract used by Hono, Fastify, tRPC, and Next route handlers
+ * ("always rethrow, framework decides"). Mount your own
+ * `app.use((err, req, res, next) => …)` to map `FORBIDDEN` to JSON / HTML.
  *
  * @example
  *   app.delete('/posts/:id',
@@ -64,17 +62,13 @@ export function expressPermissions<
   R extends InferResources<P>,
   A extends InferActions<P, R>,
 >(enforcer: Enforcer<P>, options: ExpressPermissionsOptions<P, R, A>): ExpressMiddleware {
-  return async (req, res, next) => {
+  return async (req, _res, next) => {
     try {
       const subject = await options.getSubject(req);
       const requirement = await options.require(req);
       await enforcer.enforce({ subject, ...requirement } as CheckArgs<P, R, A>);
       next();
     } catch (err) {
-      if (options.handle403 === true && err instanceof PermissionError && err.code === ERROR_CODES.FORBIDDEN) {
-        res.status(403).json({ error: 'Forbidden', code: err.code });
-        return;
-      }
       next(err);
     }
   };

@@ -12,8 +12,13 @@ import type { NextRequestLike } from './route-handler.js';
  * permission requirement and passes through (returns `undefined`) when the
  * subject is allowed.
  *
- * On deny, returns a 403 `Response` so the request is short-circuited
- * before hitting any route handler.
+ * Adapter contract is "always rethrow, framework decides" — except here:
+ * Next.js Edge middleware is run before the application's error boundary,
+ * so an unhandled throw produces a generic 500. To make `FORBIDDEN` map to
+ * an actionable response, this adapter (and **only** this adapter) catches
+ * `PermissionError(FORBIDDEN)` and returns a 403 `Response`. Every other
+ * error still bubbles. The route-handler / Hono / Fastify / tRPC / Express
+ * adapters do not catch — their host frameworks have an error path.
  *
  * @example
  *   // middleware.ts

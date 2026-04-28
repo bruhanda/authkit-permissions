@@ -17,8 +17,6 @@ export interface PrismaRoleAdapterOptions {
   readonly tenantField: string;
   /** Role column (string or enum mapped to string at the boundary). */
   readonly roleField: string;
-  /** Optional column that flips `subject.crossTenant` when the row's value is truthy. */
-  readonly crossTenantField?: string;
 }
 
 /**
@@ -37,6 +35,11 @@ export interface PrismaClientLike {
 
 /**
  * Build a role-loader for Prisma-backed memberships.
+ *
+ * Per plan §9.2.4 the cross-tenant gate is "role flag + per-call opt-in":
+ * the adapter only loads the role names. A `memberships.cross_tenant` column
+ * is **not** part of the contract — declare `crossTenant: true` on the role
+ * in the policy and pass `allowCrossTenant: true` per call instead.
  *
  * @param prisma - Prisma client instance.
  * @param options - column-name mapping.
@@ -57,14 +60,12 @@ export function createPrismaRoleAdapter(
 ): {
   loadSubject(args: { readonly userId: string; readonly tenantId: string }): Promise<Subject>;
 } {
-  const { membershipModel, userField, tenantField, roleField, crossTenantField } = options;
+  const { membershipModel, userField, tenantField, roleField } = options;
   return {
     async loadSubject({ userId, tenantId }) {
-      const select: Record<string, true> = { [roleField]: true };
-      if (crossTenantField !== undefined) select[crossTenantField] = true;
       const rows = await prisma[membershipModel]?.findMany({
         where: { [userField]: userId, [tenantField]: tenantId },
-        select,
+        select: { [roleField]: true },
       });
       if (rows === undefined) {
         throw new Error(`Prisma model "${membershipModel}" not found on client`);
@@ -72,15 +73,7 @@ export function createPrismaRoleAdapter(
       const roles = rows
         .map((row) => row[roleField])
         .filter((v): v is string => typeof v === 'string');
-      const crossTenant =
-        crossTenantField !== undefined && rows.some((row) => row[crossTenantField] === true);
-      const subject: { id: string; tenantId: string; roles: string[]; attrs?: Record<string, unknown> } = {
-        id: userId,
-        tenantId,
-        roles,
-      };
-      if (crossTenant) (subject as { crossTenant?: boolean }).crossTenant = true;
-      return subject as Subject;
+      return { id: userId, tenantId, roles } satisfies Subject;
     },
   };
 }

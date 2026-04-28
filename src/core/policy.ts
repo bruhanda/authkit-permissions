@@ -112,7 +112,10 @@ function validatePolicy(spec: PolicySpec): void {
 
   for (const [role, perResource] of Object.entries(spec.permissions)) {
     if (perResource === undefined) continue;
-    if (!(role in spec.roles)) {
+    // `Object.hasOwn` (Node 16.9+) skips the prototype chain so policies
+    // keyed on `'toString'` / `'__proto__'` cannot bypass the unknown-role
+    // check via `'toString' in {}` returning `true`.
+    if (!Object.hasOwn(spec.roles, role)) {
       throw new PermissionError(
         ERROR_CODES.UNKNOWN_ROLE,
         `Permissions reference unknown role "${role}"`,

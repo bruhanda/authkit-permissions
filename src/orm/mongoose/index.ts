@@ -12,11 +12,16 @@ export interface MongooseRoleAdapterOptions {
   readonly query: (args: {
     readonly userId: string;
     readonly tenantId: string;
-  }) => Promise<ReadonlyArray<{ readonly role: string; readonly crossTenant?: boolean }>>;
+  }) => Promise<ReadonlyArray<{ readonly role: string }>>;
 }
 
 /**
  * Build a role-loader against a Mongoose-backed memberships collection.
+ *
+ * Per plan §9.2.4 the cross-tenant gate is "role flag + per-call opt-in"
+ * — the adapter only resolves role names. A `memberships.crossTenant`
+ * field is **not** part of the contract; declare `crossTenant: true` on
+ * the role in the policy and pass `allowCrossTenant: true` per call.
  *
  * @param options - the membership query closure.
  * @returns an object with `loadSubject({ userId, tenantId })`.
@@ -24,7 +29,7 @@ export interface MongooseRoleAdapterOptions {
  * @example
  *   const adapter = createMongooseRoleAdapter({
  *     query: ({ userId, tenantId }) =>
- *       Membership.find({ userId, tenantId }, { role: 1, crossTenant: 1 }).lean(),
+ *       Membership.find({ userId, tenantId }, { role: 1 }).lean(),
  *   });
  */
 export function createMongooseRoleAdapter(options: MongooseRoleAdapterOptions): {
@@ -34,14 +39,7 @@ export function createMongooseRoleAdapter(options: MongooseRoleAdapterOptions): 
     async loadSubject({ userId, tenantId }) {
       const rows = await options.query({ userId, tenantId });
       const roles = rows.map((row) => row.role).filter((r): r is string => typeof r === 'string');
-      const crossTenant = rows.some((row) => row.crossTenant === true);
-      const subject: { id: string; tenantId: string; roles: string[]; crossTenant?: true } = {
-        id: userId,
-        tenantId,
-        roles,
-      };
-      if (crossTenant) subject.crossTenant = true;
-      return subject as Subject;
+      return { id: userId, tenantId, roles } satisfies Subject;
     },
   };
 }

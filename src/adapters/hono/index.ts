@@ -42,6 +42,13 @@ export interface HonoPermissionsOptions<
  * throws `PermissionError(FORBIDDEN)` and Hono's error handler turns it
  * into a 403.
  *
+ * On Workers / Edge runtimes the request context is torn down once the
+ * `Response` is returned, so audit promises kicked off after that point
+ * are dropped. Pass `waitUntil` to thread `c.executionCtx.waitUntil` into
+ * a per-request enforcer view (`enforcer.withWaitUntil`); the audit hook
+ * promises are then registered with the runtime and survive past the
+ * response (plan §9.4.2 / §2.4).
+ *
  * @example
  *   app.use('/api/*',
  *     honoPermissions(enforcer, {
@@ -60,7 +67,9 @@ export function honoPermissions<
     const subject = await options.getSubject(c);
     const requirement = await options.require(c);
     const args = { subject, ...requirement } as CheckArgs<P, R, A>;
-    await enforcer.enforce(args);
+    const wu = options.waitUntil?.(c) ?? c.executionCtx?.waitUntil;
+    const requestEnforcer = wu !== undefined ? enforcer.withWaitUntil(wu) : enforcer;
+    await requestEnforcer.enforce(args);
     await next();
   };
 }

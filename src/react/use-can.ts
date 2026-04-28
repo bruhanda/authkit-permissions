@@ -41,8 +41,16 @@ export function useCan<
     );
   }
   const [allowed, setAllowed] = React.useState(false);
+  const [error, setError] = React.useState<unknown>(undefined);
   const argsRef = React.useRef(args);
   argsRef.current = args;
+
+  // Throwing inside a `.catch` handler runs on the microtask queue and
+  // produces an `unhandledrejection` — it does NOT reach React's error
+  // boundary (the boundary only sees errors thrown during render or in
+  // an `errorInfo` flow). Capture the rejection in state and re-throw
+  // during render so a parent boundary can intercept.
+  if (error !== undefined) throw error;
 
   React.useEffect(() => {
     let cancelled = false;
@@ -53,9 +61,9 @@ export function useCan<
         if (!cancelled) setAllowed(next);
       })
       .catch((err: unknown) => {
-        if (!cancelled) {
-          throw err;
-        }
+        // Wrap in a function so `setState` does not interpret a function-typed
+        // rejection (rare but possible) as an updater callback.
+        if (!cancelled) setError(() => err);
       });
     return () => {
       cancelled = true;
