@@ -491,6 +491,29 @@ Numbers come from the market analysis in `reports/03-rbac-permissions.json` (id 
 
 ---
 
+## Examples
+
+Three runnable examples live in [`examples/`](./examples). Clone the repo
+and run any of them with `npx tsx`:
+
+```sh
+npx tsx examples/basic-usage.ts
+npx tsx examples/advanced-usage.ts
+npx tsx examples/with-express.ts
+```
+
+Each one is also packaged as a self-contained sandbox under
+[`examples/sandbox/`](./examples/sandbox) with the **Open in StackBlitz**
+button below — click to launch a WebContainer with the example pre-loaded.
+
+| Example | What it shows | Sandbox |
+| --- | --- | --- |
+| [`basic-usage.ts`](./examples/basic-usage.ts) | Smallest useful policy: `definePolicy` + `createEnforcer` + `check` / `enforce` / `explain`. | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/bruhanda/authkit-permissions/tree/main/examples/sandbox/basic-usage) |
+| [`advanced-usage.ts`](./examples/advanced-usage.ts) | Multi-tenant document SaaS — role inheritance, sync + async ABAC conditions, cross-tenant gate, audit hook with timing, `accessibleBy()` → Prisma / Mongo `where`. | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/bruhanda/authkit-permissions/tree/main/examples/sandbox/advanced-usage) |
+| [`with-express.ts`](./examples/with-express.ts) | Express adapter end-to-end — auth middleware → `expressPermissions(...)` → route handler, with the four interesting cases driven by `fetch()`. | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/bruhanda/authkit-permissions/tree/main/examples/sandbox/with-express) |
+
+---
+
 ## Contributing
 
 Issues and pull requests are welcome at <https://github.com/bruhanda/authkit-permissions>. Before sending a non-trivial change please open an issue to discuss the scope — the package's design constraints (zero deps, < 5 KB, no host-framework imports at type level) are deliberate and not every otherwise-useful feature is in scope (see PLAN.md §10).
